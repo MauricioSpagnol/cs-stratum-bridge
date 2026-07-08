@@ -12,6 +12,9 @@ pub enum AppError {
     NotAssignedToCaller,
 
     #[error("{0}")]
+    Rejected(String),
+
+    #[error("{0}")]
     Rpc(String),
 
     #[error(transparent)]
@@ -28,6 +31,7 @@ impl AppError {
             AppError::Unauthorized => 24,
             AppError::UnknownRequest => 20,
             AppError::NotAssignedToCaller => 25,
+            AppError::Rejected(_) => 20,
             AppError::Rpc(_) => 20,
             AppError::Db(_) | AppError::Other(_) => 20,
         };
