@@ -201,7 +201,21 @@ impl OpoiEngine {
     /// then assign every request that has both a known prompt and no
     /// current assignee to the next connected miner (round-robin).
     pub async fn poll_and_assign_tick(&self) -> anyhow::Result<()> {
+        // Learned from live testing (not from the original design): csd
+        // keeps reporting a request as PENDING via listopoirequests even
+        // after its COMMIT is confirmed on-chain (status only changes once
+        // REVEALED, if then) — without this check, an already-answered
+        // request would be re-inserted as a fresh "unassigned, no prompt"
+        // ghost entry on every single poll tick, forever, since a plain
+        // or_insert_with can't tell "never seen" apart from "already
+        // resolved, csd just hasn't updated its status field for it".
         for req in self.csd.list_pending_requests().await? {
+            if self.pending.contains_key(&req.request_id) {
+                continue;
+            }
+            if db::repo::find_active_by_request_id(&self.db, &req.request_id).await?.is_some() {
+                continue; // already has a submission in flight; not a fresh assignment candidate
+            }
             self.pending
                 .entry(req.request_id.clone())
                 .or_insert_with(|| PendingRequest { request: req, prompt_hex: None });
