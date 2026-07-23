@@ -7,14 +7,18 @@ mod opoi;
 mod payout;
 mod proxy;
 mod rpc;
+mod stake_pool;
 mod state;
 
 use std::sync::Arc;
 use std::time::Duration;
 
-use opoi::handler::OpoiHandler;
-use opoi::OpoiEngine;
+use opoi::handler::{OpoiHandler, ShardHandler, SpeculativeHandler};
+use opoi::shard_engine::ModelSourceConfig;
+use opoi::speculative_engine::DraftModelConfig;
+use opoi::{OpoiEngine, ShardEngine, SpeculativeEngine};
 use rpc::CsdRpcClient;
+use stake_pool::StakePool;
 use state::AppState;
 
 #[tokio::main]
@@ -27,10 +31,11 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let cfg = Arc::new(config::Config::load());
+    let stake_pool = Arc::new(StakePool::new(cfg.opoi_address_list()));
     tracing::info!(
         listen_addr = %cfg.listen_addr,
         upstream_pool_addr = %cfg.upstream_pool_addr,
-        opoi_address = %cfg.opoi_address,
+        opoi_addresses = ?stake_pool.addresses(),
         payout_address = %cfg.effective_payout_address(),
         "cs-stratum-bridge starting"
     );
@@ -51,7 +56,19 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!(height, "csd reachable");
 
     let registry = Arc::new(miner_registry::MinerRegistry::new());
-    let engine = Arc::new(OpoiEngine::new(csd.clone(), db_pool.clone(), registry.clone(), cfg.opoi_address.clone()));
+    let engine = Arc::new(OpoiEngine::new(csd.clone(), db_pool.clone(), registry.clone(), stake_pool.clone()));
+
+    // F15-L: only meaningfully active once BOTH a draft model is configured
+    // for some target model (DRAFT_MODEL_SOURCES_JSON) AND a draft-capable
+    // miner connects (F17-D) — see ShardEngine's `speculative` field doc and
+    // SpeculativeEngine's module doc. Constructed unconditionally (cheap;
+    // an empty DraftModelConfig just makes `is_eligible` always false, same
+    // end state as `None`, but this way `SpeculativeHandler` always has a
+    // real implementor for the proxy's session-level wiring below).
+    let speculative_engine = Arc::new(SpeculativeEngine::new(csd.clone(), registry.clone(), stake_pool.clone(), DraftModelConfig::from_env()));
+    let shard_engine = Arc::new(ShardEngine::new(
+        csd.clone(), registry.clone(), stake_pool.clone(), ModelSourceConfig::from_env(), Some(speculative_engine.clone()),
+    ));
 
     engine
         .ensure_stake(&cfg.opoi_collateral_txid, cfg.opoi_collateral_vout, &cfg.opoi_endpoint, &cfg.opoi_model_id)
@@ -60,6 +77,9 @@ async fn main() -> anyhow::Result<()> {
     // Recovery pass MUST run before any of the normal loops start (see
     // opoi::engine::recover_on_startup doc comment).
     engine.recover_on_startup().await?;
+    // ShardEngine (F15-H) has no restart-recovery pass yet — in-flight shard
+    // pipelines are simply lost on restart and re-picked-up fresh from
+    // PENDING on the next poll tick (see shard_engine.rs's module doc).
 
     spawn_interval(cfg.poll_interval_ms, {
         let engine = engine.clone();
@@ -69,6 +89,33 @@ async fn main() -> anyhow::Result<()> {
                 if let Err(e) = engine.poll_and_assign_tick().await {
                     tracing::warn!(error = %e, "poll_and_assign_tick failed");
                 }
+            }
+        }
+    });
+
+    spawn_interval(cfg.poll_interval_ms, {
+        let shard_engine = shard_engine.clone();
+        move || {
+            let shard_engine = shard_engine.clone();
+            async move {
+                if let Err(e) = shard_engine.poll_and_start_tick().await {
+                    tracing::warn!(error = %e, "shard_engine poll_and_start_tick failed");
+                }
+            }
+        }
+    });
+
+    // F15-L: mirrors ShardEngine's own retry-stalled-pipelines behavior —
+    // re-dispatches a speculative pipeline's current shard-relay or
+    // draft-generate step if nothing is actually in flight for it right now
+    // (first dispatch found no eligible miner, or the assigned one
+    // disconnected mid-step).
+    spawn_interval(cfg.poll_interval_ms, {
+        let speculative_engine = speculative_engine.clone();
+        move || {
+            let speculative_engine = speculative_engine.clone();
+            async move {
+                speculative_engine.retry_stalled_tick().await;
             }
         }
     });
@@ -111,7 +158,7 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
-    let app_state = AppState { db: db_pool.clone(), engine: engine.clone(), cfg: cfg.clone() };
+    let app_state = AppState { db: db_pool.clone(), engine: engine.clone(), shard_engine: shard_engine.clone(), cfg: cfg.clone() };
     let http_router = http::router(app_state);
     let http_addr = cfg.http_listen_addr.clone();
     tokio::spawn(async move {
@@ -129,7 +176,16 @@ async fn main() -> anyhow::Result<()> {
     });
 
     let handler: Arc<dyn OpoiHandler> = engine.clone();
-    let proxy_task = tokio::spawn(proxy::listener::run(cfg.listen_addr.clone(), cfg.upstream_pool_addr.clone(), registry.clone(), handler));
+    let shard_handler: Arc<dyn ShardHandler> = shard_engine.clone();
+    let speculative_handler: Arc<dyn SpeculativeHandler> = speculative_engine.clone();
+    let proxy_task = tokio::spawn(proxy::listener::run(
+        cfg.listen_addr.clone(),
+        cfg.upstream_pool_addr.clone(),
+        registry.clone(),
+        handler,
+        shard_handler,
+        speculative_handler,
+    ));
 
     tokio::select! {
         res = proxy_task => {

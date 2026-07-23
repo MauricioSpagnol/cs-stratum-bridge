@@ -4,11 +4,15 @@
 //! `opoiPool.js`, with the assignment-verification and startup-recovery
 //! fixes the audit called for baked in from the start rather than bolted on.
 //!
-//! Important: `self.opoi_address` (the bridge's own OPoI stake identity) is
-//! what's passed as `miner_address` to every commit/reveal RPC — the bridge
-//! custodies exactly one on-chain stake and commits/reveals as itself,
-//! regardless of which downstream miner actually produced the answer. The
-//! per-connection wallet is tracked separately, purely for payout
+//! Important: the bridge custodies a POOL of on-chain stake identities
+//! (`self.stake_pool`, see stake_pool.rs), not just one — commits/reveals
+//! happen as one of them, regardless of which downstream miner actually
+//! produced the answer. This exists because REVEAL is VRF-gated at ~3%
+//! eligibility per address on mainnet/testnet, and REVEAL must use the same
+//! address that COMMITted; `do_commit` therefore commits with EVERY pool
+//! address in parallel, and `poll_reveal_tick` tries revealing with each
+//! COMMITTED attempt (see `opoi_commit_attempts`) until one succeeds. The
+//! per-connection miner wallet is tracked separately, purely for payout
 //! attribution (see src/payout).
 
 use std::sync::Arc;
@@ -29,6 +33,7 @@ use crate::opoi::handler::OpoiHandler;
 use crate::opoi::wire::{build_assign_line, OpoiAssign, OpoiSubmitResultParams};
 use crate::rpc::types::OpoiRequest;
 use crate::rpc::CsdRpcClient;
+use crate::stake_pool::StakePool;
 
 struct PendingRequest {
     request: OpoiRequest,
@@ -52,11 +57,11 @@ pub struct OpoiEngine {
     assignments: AssignmentTracker,
     pending: DashMap<String, PendingRequest>,
     last_assigned: Mutex<Option<String>>,
-    opoi_address: String,
+    stake_pool: Arc<StakePool>,
 }
 
 impl OpoiEngine {
-    pub fn new(csd: Arc<CsdRpcClient>, db: PgPool, registry: Arc<MinerRegistry>, opoi_address: String) -> Self {
+    pub fn new(csd: Arc<CsdRpcClient>, db: PgPool, registry: Arc<MinerRegistry>, stake_pool: Arc<StakePool>) -> Self {
         Self {
             csd,
             db,
@@ -64,14 +69,14 @@ impl OpoiEngine {
             assignments: AssignmentTracker::new(),
             pending: DashMap::new(),
             last_assigned: Mutex::new(None),
-            opoi_address,
+            stake_pool,
         }
     }
 
-    /// The bridge's own OPoI stake address (used by the payout module to
-    /// know which wallet's income is being distributed).
-    pub fn opoi_address(&self) -> &str {
-        &self.opoi_address
+    /// The bridge's primary OPoI stake address (used for logging and as
+    /// the payout fallback — see `Config::effective_payout_address`).
+    pub fn primary_address(&self) -> &str {
+        self.stake_pool.primary()
     }
 
     pub fn db_pool(&self) -> &PgPool {
@@ -82,9 +87,16 @@ impl OpoiEngine {
         self.csd.clone()
     }
 
-    /// Ensures the bridge has an ACTIVE OPoI stake: stakes if none exists
-    /// (requires collateral to be configured), renews if SUSPENDED. Called
-    /// once at startup, before anything else runs.
+    /// Ensures every pool address has an ACTIVE OPoI stake where possible:
+    /// the PRIMARY address (`stake_pool.primary()`) is auto-staked from the
+    /// configured collateral if missing, exactly as before the pool existed.
+    /// Every other pool address must already have an ACTIVE stake created
+    /// out-of-band (`stakeopoi`) — there's no per-address collateral config
+    /// to auto-bootstrap them, so a missing one is logged loudly and
+    /// skipped rather than failing startup (it just contributes no
+    /// eligibility coverage until staked manually). Any SUSPENDED address,
+    /// primary or not, is renewed immediately. Called once at startup,
+    /// before anything else runs.
     pub async fn ensure_stake(
         &self,
         collateral_txid: &str,
@@ -92,49 +104,76 @@ impl OpoiEngine {
         endpoint: &str,
         model_id: &str,
     ) -> anyhow::Result<()> {
-        match self.csd.get_opoi_stake(&self.opoi_address).await? {
+        let primary = self.stake_pool.primary().to_string();
+        match self.csd.get_opoi_stake(&primary).await? {
             None => {
                 if collateral_txid.is_empty() {
                     anyhow::bail!(
-                        "no OPoI stake found for {} and no OPOI_COLLATERAL_TXID configured to create one",
-                        self.opoi_address
+                        "no OPoI stake found for primary address {} and no OPOI_COLLATERAL_TXID configured to create one",
+                        primary
                     );
                 }
                 let res = self
                     .csd
-                    .stake_opoi(&self.opoi_address, collateral_txid, collateral_vout, endpoint, model_id)
+                    .stake_opoi(&primary, collateral_txid, collateral_vout, endpoint, model_id)
                     .await?;
                 let _ = db::repo::log_stake_event(
                     &self.db,
                     "STAKE",
                     Some(&res.txid),
-                    &format!("initial stake, amount={}", res.amount),
+                    &format!("initial stake for {primary}, amount={}", res.amount),
                 )
                 .await;
-                tracing::info!(txid = %res.txid, "OPoI stake created");
+                tracing::info!(txid = %res.txid, address = %primary, "OPoI stake created (primary)");
             }
             Some(stake) if stake.status == "SUSPENDED" => {
-                tracing::warn!("OPoI stake is SUSPENDED at startup; renewing immediately");
-                self.renew_tick().await;
+                tracing::warn!(address = %primary, "OPoI stake is SUSPENDED at startup; renewing immediately");
+                self.renew_one(&primary).await;
             }
             Some(stake) => {
-                tracing::info!(status = %stake.status, "OPoI stake already exists");
+                tracing::info!(address = %primary, status = %stake.status, "OPoI stake already exists (primary)");
+            }
+        }
+
+        for addr in &self.stake_pool.addresses()[1..] {
+            match self.csd.get_opoi_stake(addr).await? {
+                None => {
+                    tracing::error!(
+                        address = %addr,
+                        "OPoI pool address has NO stake — create one out-of-band via `stakeopoi` \
+                         before this address contributes any eligibility coverage; skipping for now"
+                    );
+                }
+                Some(stake) if stake.status == "SUSPENDED" => {
+                    tracing::warn!(address = %addr, "OPoI pool address stake is SUSPENDED at startup; renewing immediately");
+                    self.renew_one(addr).await;
+                }
+                Some(stake) => {
+                    tracing::info!(address = %addr, status = %stake.status, "OPoI pool address stake already exists");
+                }
             }
         }
         Ok(())
     }
 
-    /// Periodic keep-alive renewal. Called on an interval by main.rs, and
-    /// once at startup by `ensure_stake` if the stake was found SUSPENDED.
+    /// Periodic keep-alive renewal for every address in the pool. Called on
+    /// an interval by main.rs, and once at startup by `ensure_stake` for any
+    /// address found SUSPENDED.
     pub async fn renew_tick(&self) {
-        match self.csd.renew_opoi_stake(&self.opoi_address).await {
+        for addr in self.stake_pool.addresses() {
+            self.renew_one(addr).await;
+        }
+    }
+
+    async fn renew_one(&self, address: &str) {
+        match self.csd.renew_opoi_stake(address).await {
             Ok(txid) => {
-                let _ = db::repo::log_stake_event(&self.db, "RENEW", Some(&txid), "periodic renewal").await;
-                tracing::info!(txid = %txid, "OPoI stake renewed");
+                let _ = db::repo::log_stake_event(&self.db, "RENEW", Some(&txid), &format!("periodic renewal for {address}")).await;
+                tracing::info!(txid = %txid, address = %address, "OPoI stake renewed");
             }
             Err(e) => {
-                let _ = db::repo::log_stake_event(&self.db, "RENEW_ERROR", None, &e.to_string()).await;
-                tracing::warn!(error = %e, "OPoI stake renewal failed");
+                let _ = db::repo::log_stake_event(&self.db, "RENEW_ERROR", None, &format!("{address}: {e}")).await;
+                tracing::warn!(error = %e, address = %address, "OPoI stake renewal failed");
             }
         }
     }
@@ -152,9 +191,9 @@ impl OpoiEngine {
             .for_each_concurrent(4, |sub| {
                 let csd = self.csd.clone();
                 let pool = self.db.clone();
-                let opoi_address = self.opoi_address.clone();
+                let stake_pool = self.stake_pool.clone();
                 async move {
-                    do_commit(csd, pool, opoi_address, sub.id, sub.request_id, sub.response_hash, sub.token_count as u32).await;
+                    do_commit(csd, pool, stake_pool, sub.id, sub.request_id, sub.response_hash, sub.token_count as u32).await;
                 }
             })
             .await;
@@ -241,6 +280,16 @@ impl OpoiEngine {
                 continue;
             };
 
+            // F15-H (Sessão 3): a request whose model has an ACTIVE manifest
+            // is shard-routed — ShardEngine handles it (own poll tick, own
+            // prompt cache), not the whole-model path here. Left cached in
+            // `self.pending` rather than removed: harmless, re-checked next
+            // tick at the same cost ShardEngine already pays for the same
+            // model_id.
+            if matches!(self.csd.get_model_manifest(&model).await, Ok(m) if m.status == "ACTIVE") {
+                continue;
+            }
+
             let wallet = {
                 let mut last = self.last_assigned.lock();
                 let Some(wallet) = self.registry.pick_next(&last) else {
@@ -267,17 +316,20 @@ impl OpoiEngine {
         Ok(())
     }
 
-    /// One tick of: reveal every COMMITTED submission whose window has
-    /// closed, then publish every REVEALED submission not yet published.
+    /// One tick of: for every submission still COMMITTED, try revealing
+    /// with each pool address whose commit window has closed (stopping at
+    /// the first VRF-eligible one), then publish every REVEALED submission
+    /// not yet published.
     pub async fn poll_reveal_tick(&self) -> anyhow::Result<()> {
         let height = self.csd.get_chain_height().await?;
 
-        for sub in db::repo::list_committed(&self.db).await? {
-            if let Some(closes) = sub.commit_window_closes_at_height {
-                if height >= closes as u64 {
-                    self.do_reveal(&sub).await;
-                }
-            }
+        let candidates = db::repo::list_reveal_ready_candidates(&self.db, height as i64).await?;
+        let mut by_submission: std::collections::HashMap<i64, Vec<db::RevealCandidate>> = std::collections::HashMap::new();
+        for c in candidates {
+            by_submission.entry(c.submission_id).or_default().push(c);
+        }
+        for (_submission_id, attempts) in by_submission {
+            self.try_reveal_any(attempts).await;
         }
 
         for sub in db::repo::list_revealed_unpublished(&self.db).await? {
@@ -287,27 +339,43 @@ impl OpoiEngine {
         Ok(())
     }
 
-    async fn do_reveal(&self, sub: &Submission) {
-        let Some(nonce_hex) = sub.commit_nonce_hex.clone() else {
-            tracing::error!(submission_id = sub.id, "COMMITTED submission missing commit_nonce_hex; cannot reveal");
-            return;
-        };
-
-        match self
-            .csd
-            .submit_response_reveal(&sub.request_id, &sub.response_hash, &self.opoi_address, sub.token_count as u32, &nonce_hex)
-            .await
-        {
-            Ok(txid) => {
-                if let Err(e) = db::repo::mark_revealed(&self.db, sub.id, &txid).await {
-                    tracing::error!(error = %e, submission_id = sub.id, "failed to persist REVEALED state");
-                } else {
-                    tracing::info!(submission_id = sub.id, request_id = %sub.request_id, txid = %txid, "OPoI response revealed on-chain");
+    /// Tries revealing with each ready attempt in turn, stopping at the
+    /// first one the daemon accepts (VRF-eligible for this address). The
+    /// rest are left COMMITTED and simply never revealed once one succeeds
+    /// — `poll_reveal_tick`'s next call excludes them anyway, since their
+    /// parent submission will have flipped to REVEALED.
+    async fn try_reveal_any(&self, candidates: Vec<db::RevealCandidate>) {
+        for c in candidates {
+            match self
+                .csd
+                .submit_response_reveal(&c.request_id, &c.response_hash, &c.opoi_address, c.token_count as u32, &c.nonce_hex)
+                .await
+            {
+                Ok(txid) => {
+                    if let Err(e) = db::repo::mark_attempt_revealed(&self.db, c.attempt_id, &txid).await {
+                        tracing::error!(error = %e, attempt_id = c.attempt_id, "failed to persist REVEALED attempt");
+                    }
+                    if let Err(e) = db::repo::mark_revealed(&self.db, c.submission_id, &txid).await {
+                        tracing::error!(error = %e, submission_id = c.submission_id, "failed to persist REVEALED submission");
+                    } else {
+                        tracing::info!(
+                            submission_id = c.submission_id, request_id = %c.request_id,
+                            address = %c.opoi_address, txid = %txid,
+                            "OPoI response revealed on-chain (this pool address was VRF-eligible)"
+                        );
+                    }
+                    return;
                 }
-            }
-            // Deliberate retry-forever: stays COMMITTED, tried again next tick.
-            Err(e) => {
-                tracing::debug!(error = %e, submission_id = sub.id, "reveal not ready yet / failed, will retry");
+                // Deliberate retry-forever across ticks: not eligible (or
+                // transiently failed) this time, try the next candidate for
+                // this submission; if none succeed this tick, all stay
+                // COMMITTED and are re-tried next tick.
+                Err(e) => {
+                    tracing::debug!(
+                        error = %e, submission_id = c.submission_id, address = %c.opoi_address,
+                        "reveal not eligible/ready for this pool address, trying next"
+                    );
+                }
             }
         }
     }
@@ -403,12 +471,12 @@ impl OpoiHandler for OpoiEngine {
         // miner's ACK doesn't wait on the on-chain RPC).
         let csd = self.csd.clone();
         let pool = self.db.clone();
-        let opoi_address = self.opoi_address.clone();
+        let stake_pool = self.stake_pool.clone();
         let request_id = params.request_id.clone();
         let response_hash = params.response_hash.clone();
         let token_count = params.token_count;
         tokio::spawn(async move {
-            do_commit(csd, pool, opoi_address, id, request_id, response_hash, token_count).await;
+            do_commit(csd, pool, stake_pool, id, request_id, response_hash, token_count).await;
         });
 
         Ok(id)
@@ -423,26 +491,70 @@ impl OpoiHandler for OpoiEngine {
 /// `tokio::spawn`ed 'static task (the normal fire-and-forget path) and from
 /// `recover_on_startup`'s bounded-concurrency stream — neither needs to
 /// borrow `OpoiEngine` itself, only these cheaply-cloneable pieces.
+///
+/// Commits with EVERY address in the stake pool concurrently, not just one:
+/// REVEAL is VRF-gated (~3% eligibility per address, see stake_pool.rs) and
+/// must use the same address that committed, so which address will turn
+/// out eligible can't be known ahead of commit time — the only way to find
+/// out is to have already committed with it. Each attempt's outcome is
+/// persisted independently (`opoi_commit_attempts`); the submission overall
+/// moves to COMMITTED as soon as at least one attempt succeeds, or FAILED
+/// only if every pool address failed to commit.
 async fn do_commit(
     csd: Arc<CsdRpcClient>,
     pool: PgPool,
-    opoi_address: String,
+    stake_pool: Arc<StakePool>,
     submission_id: i64,
     request_id: String,
     response_hash: String,
     token_count: u32,
 ) {
-    match csd.submit_response_commit(&request_id, &response_hash, &opoi_address, token_count).await {
-        Ok(res) => {
-            if let Err(e) = db::repo::mark_committed(&pool, submission_id, &res.txid, &res.nonce_hex, res.commit_window_closes_at_height as i32).await {
-                tracing::error!(error = %e, submission_id, "failed to persist COMMITTED state after successful RPC");
-            } else {
-                tracing::info!(submission_id, request_id = %request_id, txid = %res.txid, "OPoI response committed on-chain");
+    let results: Vec<(String, Result<crate::rpc::types::CommitResult, AppError>)> = stream::iter(stake_pool.addresses().to_vec())
+        .map(|addr| {
+            let csd = csd.clone();
+            let request_id = request_id.clone();
+            let response_hash = response_hash.clone();
+            async move {
+                let res = csd.submit_response_commit(&request_id, &response_hash, &addr, token_count).await;
+                (addr, res)
+            }
+        })
+        .buffer_unordered(4)
+        .collect()
+        .await;
+
+    let mut first_success: Option<(String, crate::rpc::types::CommitResult)> = None;
+
+    for (addr, res) in results {
+        match res {
+            Ok(r) => {
+                if let Err(e) =
+                    db::repo::upsert_commit_attempt_success(&pool, submission_id, &addr, &r.txid, &r.nonce_hex, r.commit_window_closes_at_height as i32).await
+                {
+                    tracing::error!(error = %e, submission_id, address = %addr, "failed to persist COMMITTED attempt");
+                } else {
+                    tracing::info!(submission_id, request_id = %request_id, address = %addr, txid = %r.txid, "OPoI response committed on-chain (one pool address)");
+                }
+                if first_success.is_none() {
+                    first_success = Some((addr, r));
+                }
+            }
+            Err(e) => {
+                let _ = db::repo::upsert_commit_attempt_failure(&pool, submission_id, &addr, &e.to_string()).await;
+                tracing::debug!(error = %e, submission_id, address = %addr, "commit attempt failed for this pool address");
             }
         }
-        Err(e) => {
-            tracing::warn!(error = %e, submission_id, request_id = %request_id, "submitopoiresponsecommit failed; marking FAILED");
-            if let Err(e2) = db::repo::mark_failed(&pool, submission_id, &e.to_string()).await {
+    }
+
+    match first_success {
+        Some((_addr, r)) => {
+            if let Err(e) = db::repo::mark_committed(&pool, submission_id, &r.txid, &r.nonce_hex, r.commit_window_closes_at_height as i32).await {
+                tracing::error!(error = %e, submission_id, "failed to persist overall COMMITTED state");
+            }
+        }
+        None => {
+            tracing::warn!(submission_id, request_id = %request_id, "every pool address failed to commit; marking FAILED");
+            if let Err(e2) = db::repo::mark_failed(&pool, submission_id, "all stake-pool addresses failed to commit").await {
                 tracing::error!(error = %e2, submission_id, "failed to persist FAILED state");
             }
         }

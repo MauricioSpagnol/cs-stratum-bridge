@@ -75,3 +75,18 @@ pub struct Submission {
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
+
+/// A commit attempt (see `stake_pool.rs`/migration `0002_commit_attempts.sql`
+/// for why a submission can have more than one) joined with the fields of
+/// its parent submission needed to attempt a reveal — what
+/// `poll_reveal_tick` actually iterates.
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct RevealCandidate {
+    pub attempt_id: i64,
+    pub submission_id: i64,
+    pub opoi_address: String,
+    pub nonce_hex: String,
+    pub request_id: String,
+    pub response_hash: String,
+    pub token_count: i32,
+}

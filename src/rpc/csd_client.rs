@@ -191,6 +191,44 @@ impl CsdRpcClient {
         Ok(())
     }
 
+    /// F15-H (Sessão 3): fetches a model's manifest — arch_type/num_layers to
+    /// size the shard pipeline, backbone_pom_root to verify the GGUF a miner
+    /// downloads, status to gate on ACTIVE. Read-only, no miner_address.
+    pub async fn get_model_manifest(&self, model_id: &str) -> Result<ModelManifest, AppError> {
+        self.call("getmodelmanifest", serde_json::json!([model_id])).await
+    }
+
+    /// F15-H (Sessão 3): fetches the Model Execution Graph — the ordered
+    /// list of shards `shard_engine.rs` dispatches in sequence. Read-only.
+    pub async fn get_model_graph(&self, model_id: &str) -> Result<ModelGraph, AppError> {
+        self.call("getmodelgraph", serde_json::json!([model_id])).await
+    }
+
+    /// F15-H (Sessão 3): VRF self-claim of the coordinator role for a
+    /// request's shard pipeline. Fails with an RPC error ("VRF proof
+    /// generation failed") if `miner_address` isn't eligible this round —
+    /// callers should treat that as "try the next pool address," never as
+    /// a fatal error (see `stake_pool.rs`).
+    pub async fn claim_coordinator(&self, request_id: &str, miner_address: &str) -> Result<ClaimResult, AppError> {
+        self.call("claimcoordinator", serde_json::json!([request_id, miner_address])).await
+    }
+
+    /// F15-H (Sessão 3): VRF self-claim + publish of one shard's real output
+    /// hash. Same "not eligible this round" failure mode as
+    /// `claim_coordinator` — never fatal, just means this pool address isn't
+    /// the one VRF selected for this (request, shard_index) pair.
+    pub async fn submit_shard_result(
+        &self,
+        request_id: &str,
+        shard_index: u32,
+        miner_address: &str,
+        boundary_output_hash_hex: &str,
+        token_count: u32,
+    ) -> Result<ShardResultTxRes, AppError> {
+        let params = serde_json::json!([request_id, shard_index, miner_address, boundary_output_hash_hex, "", token_count]);
+        self.call("submitshardresult", params).await
+    }
+
     /// Batches miner payouts in a single wallet transaction.
     ///
     /// `sendmany` is a standard Bitcoin-Core-family wallet RPC, inherited by

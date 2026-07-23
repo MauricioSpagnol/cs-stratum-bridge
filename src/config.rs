@@ -28,10 +28,18 @@ pub struct Config {
     #[arg(long, env = "DATABASE_URL")]
     pub database_url: String,
 
-    /// The bridge's own OPoI stake identity. Its private key must already be
-    /// imported in csd's own wallet — this service never holds key material.
-    #[arg(long, env = "OPOI_ADDRESS")]
-    pub opoi_address: String,
+    /// Comma-separated list of the bridge's OPoI stake identities. Each
+    /// address's private key must already be imported in csd's own wallet
+    /// (this service never holds key material) and, beyond the first/
+    /// primary address, must already have an ACTIVE stake created
+    /// out-of-band (`stakeopoi`) — OPOI_COLLATERAL_TXID/_VOUT below only
+    /// auto-bootstrap the primary one. Multiple identities exist purely to
+    /// raise the odds of VRF eligibility: nOPoIVrfThreshold/
+    /// nOPoICoordinatorThreshold/nOPoIShardThreshold gate every reveal/
+    /// coordinator-claim/shard-submit at ~3% per address on both mainnet
+    /// and testnet (only regtest relaxes this) — see StakePool.
+    #[arg(long, env = "OPOI_ADDRESSES")]
+    pub opoi_addresses: String,
 
     #[arg(long, env = "OPOI_COLLATERAL_TXID", default_value = "")]
     pub opoi_collateral_txid: String,
@@ -79,11 +87,27 @@ pub struct Config {
 }
 
 impl Config {
+    /// Parses `opoi_addresses` into a trimmed, non-empty list — the input
+    /// to `StakePool::new`.
+    pub fn opoi_address_list(&self) -> Vec<String> {
+        self.opoi_addresses
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect()
+    }
+
+    /// The first configured address — the one OPOI_COLLATERAL_TXID/_VOUT
+    /// auto-bootstraps at startup, and the payout fallback below.
+    pub fn primary_opoi_address(&self) -> &str {
+        self.opoi_addresses.split(',').next().map(str::trim).unwrap_or("")
+    }
+
     /// Address that should sign/receive miner payouts — payout_address if
-    /// set, otherwise falls back to the bridge's own OPoI stake address.
+    /// set, otherwise falls back to the bridge's primary OPoI stake address.
     pub fn effective_payout_address(&self) -> &str {
         if self.payout_address.is_empty() {
-            &self.opoi_address
+            self.primary_opoi_address()
         } else {
             &self.payout_address
         }

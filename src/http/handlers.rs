@@ -38,6 +38,10 @@ pub async fn submit_prompt(State(state): State<AppState>, headers: HeaderMap, Js
     }
 
     let prompt_hex = hex::encode(body.prompt.as_bytes());
+    // Fed to both engines: at intake time it isn't known yet whether this
+    // request will turn out to be shard-routed (ShardEngine) or whole-model
+    // (OpoiEngine) — that's only decided once getmodelmanifest resolves.
+    state.shard_engine.receive_prompt(&body.request_id, prompt_hex.clone());
     match state.engine.receive_prompt(&body.request_id, prompt_hex).await {
         Ok(true) => (StatusCode::OK, Json(AcceptedResponse { accepted: true })).into_response(),
         Ok(false) => (StatusCode::NOT_FOUND, "request_id not found on-chain").into_response(),

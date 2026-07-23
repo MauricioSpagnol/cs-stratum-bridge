@@ -35,6 +35,14 @@ sqlx        = { version = "0.7", features = ["runtime-tokio-rustls", "postgres",
 sha2        = "0.10"
 hex         = "0.4"
 
+# F15-L (speculative_engine.rs): the bridge needs to know the prompt's REAL
+# token count (to seed `base`, the KV-cache position speculative rounds are
+# tracked relative to) without doing any inference itself — same tokenizer
+# crate/version cs-miner already uses, downloading the same tokenizer.json
+# ModelSource already has a URL/hash for (see gguf_fetch-style caching in
+# opoi/speculative_engine.rs).
+tokenizers  = "0.22"
+
 # logging
 tracing             = "0.1"
 tracing-subscriber  = { version = "0.3", features = ["env-filter"] }

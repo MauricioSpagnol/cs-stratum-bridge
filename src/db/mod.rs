@@ -6,4 +6,4 @@
 pub mod models;
 pub mod repo;
 
-pub use models::{Submission, SubmissionStatus};
+pub use models::{RevealCandidate, Submission, SubmissionStatus};

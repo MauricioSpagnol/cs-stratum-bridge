@@ -11,7 +11,7 @@ use sqlx::{PgPool, Row};
 
 use crate::error::AppError;
 
-use super::models::Submission;
+use super::models::{RevealCandidate, Submission};
 
 /// Inserts a new submission row with `status = 'RECEIVED'` and returns its
 /// generated id.
@@ -264,6 +264,110 @@ pub async fn mark_paid(
     )
     .bind(payout_txid)
     .bind(request_ids)
+    .execute(pool)
+    .await?;
+
+    Ok(())
+}
+
+/// Records (upserting on retry) that `opoi_address` successfully committed
+/// on-chain for `submission_id` — one of possibly several pool addresses
+/// tried in parallel by `do_commit` (see stake_pool.rs).
+pub async fn upsert_commit_attempt_success(
+    pool: &PgPool,
+    submission_id: i64,
+    opoi_address: &str,
+    commit_txid: &str,
+    nonce_hex: &str,
+    closes_at_height: i32,
+) -> Result<(), AppError> {
+    sqlx::query(
+        r#"
+        INSERT INTO opoi_commit_attempts
+            (submission_id, opoi_address, status, commit_txid, commit_nonce_hex, commit_window_closes_at_height)
+        VALUES ($1, $2, 'COMMITTED', $3, $4, $5)
+        ON CONFLICT (submission_id, opoi_address) DO UPDATE
+        SET status = 'COMMITTED', commit_txid = $3, commit_nonce_hex = $4,
+            commit_window_closes_at_height = $5, fail_reason = NULL, updated_at = NOW()
+        "#,
+    )
+    .bind(submission_id)
+    .bind(opoi_address)
+    .bind(commit_txid)
+    .bind(nonce_hex)
+    .bind(closes_at_height)
+    .execute(pool)
+    .await?;
+
+    Ok(())
+}
+
+/// Records (upserting on retry) that `opoi_address` failed to commit for
+/// `submission_id` — e.g. that address's stake isn't ACTIVE, or the RPC
+/// otherwise rejected it. Not a VRF-eligibility failure: COMMIT itself
+/// isn't VRF-gated (only REVEAL is), so a commit failure means something
+/// more basic is wrong with that address.
+pub async fn upsert_commit_attempt_failure(
+    pool: &PgPool,
+    submission_id: i64,
+    opoi_address: &str,
+    reason: &str,
+) -> Result<(), AppError> {
+    let truncated: String = reason.chars().take(2000).collect();
+
+    sqlx::query(
+        r#"
+        INSERT INTO opoi_commit_attempts (submission_id, opoi_address, status, fail_reason)
+        VALUES ($1, $2, 'FAILED', $3)
+        ON CONFLICT (submission_id, opoi_address) DO UPDATE
+        SET status = 'FAILED', fail_reason = $3, updated_at = NOW()
+        "#,
+    )
+    .bind(submission_id)
+    .bind(opoi_address)
+    .bind(truncated)
+    .execute(pool)
+    .await?;
+
+    Ok(())
+}
+
+/// Attempts ready to try revealing right now: COMMITTED, their own window
+/// already closed, belonging to a submission still at COMMITTED overall
+/// (i.e. no other pool address has revealed it yet). Joined with the
+/// parent submission's request_id/response_hash/token_count since REVEAL
+/// needs all of it alongside the per-attempt nonce_hex.
+pub async fn list_reveal_ready_candidates(pool: &PgPool, height: i64) -> Result<Vec<RevealCandidate>, AppError> {
+    let rows = sqlx::query_as::<_, RevealCandidate>(
+        r#"
+        SELECT a.id AS attempt_id, a.submission_id, a.opoi_address,
+               a.commit_nonce_hex AS nonce_hex,
+               s.request_id, s.response_hash, s.token_count
+        FROM opoi_commit_attempts a
+        JOIN opoi_submissions s ON s.id = a.submission_id
+        WHERE a.status = 'COMMITTED'
+          AND a.commit_window_closes_at_height <= $1
+          AND s.status = 'COMMITTED'
+        "#,
+    )
+    .bind(height)
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows)
+}
+
+/// Marks one specific attempt as the one that revealed successfully.
+pub async fn mark_attempt_revealed(pool: &PgPool, attempt_id: i64, reveal_txid: &str) -> Result<(), AppError> {
+    sqlx::query(
+        r#"
+        UPDATE opoi_commit_attempts
+        SET status = 'REVEALED', reveal_txid = $1, updated_at = NOW()
+        WHERE id = $2
+        "#,
+    )
+    .bind(reveal_txid)
+    .bind(attempt_id)
     .execute(pool)
     .await?;
 

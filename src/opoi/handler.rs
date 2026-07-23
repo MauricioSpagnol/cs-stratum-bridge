@@ -6,7 +6,7 @@
 use async_trait::async_trait;
 
 use crate::error::AppError;
-use crate::opoi::wire::OpoiSubmitResultParams;
+use crate::opoi::wire::{OpoiDraftResult, OpoiKvRollbackAck, OpoiShardResult, OpoiSubmitResultParams};
 
 #[async_trait]
 pub trait OpoiHandler: Send + Sync {
@@ -25,5 +25,46 @@ pub trait OpoiHandler: Send + Sync {
     /// disconnects, so any request_id assigned to it (but never answered)
     /// can be released back to the pool for reassignment on the next
     /// poll_and_assign_tick, instead of staying stuck forever.
+    async fn on_disconnect(&self, wallet: &str);
+}
+
+/// F15-H (Sessão 3): the shard-pipeline counterpart of `OpoiHandler`, kept
+/// as a SEPARATE trait rather than added to `OpoiHandler` — `ShardEngine`
+/// is a distinct component from `OpoiEngine` (see shard_engine.rs's module
+/// doc), and mixing the two concerns into one trait would force `OpoiEngine`
+/// to implement a method it has no business handling.
+#[async_trait]
+pub trait ShardHandler: Send + Sync {
+    /// Called when an authorized downstream connection sends `opoi.shard_result`.
+    async fn handle_shard_result(&self, wallet: &str, result: OpoiShardResult) -> Result<(), AppError>;
+
+    /// Mirrors `OpoiHandler::on_disconnect` — releases any shard assignment
+    /// the disconnecting wallet was holding.
+    async fn on_disconnect(&self, wallet: &str);
+}
+
+/// F15-L: the speculative-decoding counterpart of `ShardHandler` — kept as
+/// its own trait, same reasoning as `ShardHandler` vs `OpoiHandler`
+/// (`SpeculativeEngine` is a distinct component, see
+/// `speculative_engine.rs`'s module doc). Neither inbound message this
+/// trait handles gets an explicit reply line sent back down the wire (see
+/// `proxy/session.rs`'s interception of `opoi.draft_result` /
+/// `opoi.kv_rollback_ack` for why: cs-miner's own `pow/stratum.rs` has no
+/// response-handling branch for either ack's tagged request id — it only
+/// logs having sent them — so a reply here would either go unread or, worse,
+/// be misread by the generic `id >= 3` PoW-submit-ack branch).
+#[async_trait]
+pub trait SpeculativeHandler: Send + Sync {
+    /// Called when an authorized downstream connection sends
+    /// `opoi.draft_result` (the reply to a previously-pushed
+    /// `opoi.draft_generate`).
+    async fn handle_draft_result(&self, wallet: &str, result: OpoiDraftResult);
+
+    /// Called when an authorized downstream connection sends
+    /// `opoi.kv_rollback_ack` (the reply to a previously-pushed
+    /// `opoi.kv_rollback`).
+    async fn handle_kv_rollback_ack(&self, wallet: &str, ack: OpoiKvRollbackAck);
+
+    /// Mirrors `ShardHandler::on_disconnect`.
     async fn on_disconnect(&self, wallet: &str);
 }
