@@ -500,7 +500,18 @@ impl OpoiHandler for OpoiEngine {
 /// persisted independently (`opoi_commit_attempts`); the submission overall
 /// moves to COMMITTED as soon as at least one attempt succeeds, or FAILED
 /// only if every pool address failed to commit.
-async fn do_commit(
+///
+/// `pub(crate)` (not private): also called by `shard_engine.rs` once a shard
+/// pipeline's final token/shard result comes back, so a shard-routed
+/// request's response drives the exact same commit -> reveal -> publish ->
+/// payout lifecycle a whole-model response does, instead of a second
+/// reimplementation. `poll_reveal_tick`/`do_publish` (this file) and
+/// `payout::payout_tick` are all already DB-row-driven, not
+/// `OpoiEngine`-instance-driven, so nothing else needed changing for a
+/// shard-created `opoi_submissions` row to self-heal through the rest of
+/// the lifecycle the same way — this function is the one place that
+/// genuinely needed sharing.
+pub(crate) async fn do_commit(
     csd: Arc<CsdRpcClient>,
     pool: PgPool,
     stake_pool: Arc<StakePool>,

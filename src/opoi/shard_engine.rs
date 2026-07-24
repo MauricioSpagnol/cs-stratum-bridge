@@ -32,13 +32,17 @@
 //! restart-safe persistence for shard pipelines is future work, not a
 //! correctness requirement for this first working version.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use dashmap::DashMap;
 use parking_lot::Mutex;
 use sha2::{Digest, Sha256};
+use sqlx::PgPool;
 
+use crate::db;
 use crate::miner_registry::MinerRegistry;
+use crate::opoi::engine::do_commit;
 use crate::opoi::speculative_engine::SpeculativeEngine;
 use crate::opoi::wire::{build_shard_assign_line, OpoiShardAssign, ShardInputWire, ShardOutputWire};
 use crate::rpc::types::{ModelGraph, ModelManifest, ShardDescriptor};
@@ -92,6 +96,10 @@ struct PipelineState {
     /// creation time to have no `EXPERT` entries (see `poll_and_dispatch_tick`).
     shards: Vec<ShardDescriptor>,
     manifest: ModelManifest,
+    /// Carried through purely for the eventual `opoi_submissions` row (same
+    /// informational-only field `OpoiEngine` fills from its own `pending`
+    /// cache) — not used for any pipeline-control decision.
+    prompt_hash: String,
     max_tokens: u32,
     /// Index into `shards` (NOT `shard_index` directly, though they
     /// coincide for a well-formed dense-only graph starting at 0).
@@ -101,6 +109,29 @@ struct PipelineState {
     /// re-dispatch (e.g. after a miner disconnects mid-shard) can resend
     /// the identical assignment instead of needing to reconstruct it.
     current_input: ShardInputWire,
+    /// The real decoded-token-id output of the LAST shard at every token
+    /// step, in generation order — this IS the response, accumulated as it
+    /// arrives (see `handle_shard_result_inner`). The bridge has no
+    /// tokenizer of its own (only miners do, via `gguf_fetch.rs`/GGUF
+    /// vocab), so unlike `OpoiEngine` (whose miners hand back decoded text
+    /// directly as `response_hex`) there is no human-readable text
+    /// available here to publish — see `finalize_pipeline`'s doc comment
+    /// for how this is turned into a `response_hex`/`response_hash` pair
+    /// that still satisfies the on-chain commit/reveal/publish
+    /// hash-consistency requirement.
+    generated_token_ids: Vec<u32>,
+    /// Payout-attribution bookkeeping: how many shard-result steps each
+    /// wallet actually delivered for this request. A dense pipeline
+    /// round-robins EVERY shard dispatch across whichever miners are
+    /// connected at that instant (see `dispatch_current`), so — unlike
+    /// `OpoiEngine`, where exactly one assigned miner produces the entire
+    /// response — a shard-routed request can genuinely involve several
+    /// different downstream wallets. See `finalize_pipeline`'s doc comment
+    /// for how this is resolved into a single payout attribution (the
+    /// `opoi_submissions` schema only has room for one `miner_wallet` per
+    /// on-chain response — a hard constraint tied to there being exactly
+    /// one commit/reveal/publish per request_id, not a stylistic choice).
+    contributions: BTreeMap<String, u32>,
 }
 
 /// Tracks which wallet the CURRENTLY in-flight shard step of each
@@ -118,6 +149,7 @@ struct ShardAssignment {
 
 pub struct ShardEngine {
     csd: Arc<CsdRpcClient>,
+    db: PgPool,
     registry: Arc<MinerRegistry>,
     stake_pool: Arc<StakePool>,
     model_sources: ModelSourceConfig,
@@ -143,11 +175,12 @@ pub struct ShardEngine {
 
 impl ShardEngine {
     pub fn new(
-        csd: Arc<CsdRpcClient>, registry: Arc<MinerRegistry>, stake_pool: Arc<StakePool>, model_sources: ModelSourceConfig,
+        csd: Arc<CsdRpcClient>, db: PgPool, registry: Arc<MinerRegistry>, stake_pool: Arc<StakePool>, model_sources: ModelSourceConfig,
         speculative: Option<Arc<SpeculativeEngine>>,
     ) -> Self {
         Self {
             csd,
+            db,
             registry,
             stake_pool,
             model_sources,
@@ -250,10 +283,13 @@ impl ShardEngine {
                 PipelineState {
                     shards,
                     manifest,
+                    prompt_hash: req.prompt_hash.clone(),
                     max_tokens: req.max_tokens,
                     pos: 0,
                     token_index: 0,
                     current_input: ShardInputWire::Prompt { prompt_hex: prompt_hex.clone() },
+                    generated_token_ids: Vec::new(),
+                    contributions: BTreeMap::new(),
                 },
             );
             self.prompt_cache.remove(&req.request_id);
@@ -359,6 +395,14 @@ impl ShardEngine {
         let Some(model_id) = model_id else { return Err(crate::error::AppError::UnknownRequest) };
         let Some(source) = self.model_sources.get(&model_id).cloned() else { return Err(crate::error::AppError::UnknownRequest) };
 
+        // Payout-attribution bookkeeping (see `PipelineState::contributions`
+        // doc comment): every accepted shard result is one real unit of
+        // compute delivered by `wallet`, whether or not it turns out to be
+        // the pipeline's last step.
+        if let Some(mut pipeline) = self.pipelines.get_mut(&request_id) {
+            *pipeline.contributions.entry(wallet.to_string()).or_insert(0) += 1;
+        }
+
         // Every shard gets exactly ONE on-chain submission per request — at
         // the end of the WHOLE generation (last token_index), never per
         // token step. The daemon only ever accepts the FIRST
@@ -411,9 +455,16 @@ impl ShardEngine {
             return Ok(());
         };
 
+        // This token step's real generated output, whether or not it's the
+        // pipeline's last — accumulated here is what `finalize_pipeline`
+        // eventually turns into the on-chain RESPONSE content.
+        if let Some(mut pipeline) = self.pipelines.get_mut(&request_id) {
+            pipeline.generated_token_ids.push(next_token_id);
+        }
+
         if is_last_token {
-            tracing::info!(request_id = %request_id, "shard pipeline finished (max_tokens reached)");
-            self.pipelines.remove(&request_id);
+            tracing::info!(request_id = %request_id, "shard pipeline finished (max_tokens reached); driving commit/reveal/publish/payout");
+            self.finalize_pipeline(&request_id).await;
             return Ok(());
         }
 
@@ -428,6 +479,107 @@ impl ShardEngine {
         Ok(())
     }
 
+    /// Drives a just-completed shard pipeline's response through the SAME
+    /// commit -> reveal -> publish -> payout lifecycle `OpoiEngine` already
+    /// has working for whole-model responses, by writing the same
+    /// `opoi_submissions` row shape it does and handing off to its shared
+    /// `do_commit` (see that function's doc comment) — reveal/publish
+    /// (`OpoiEngine::poll_reveal_tick`/`do_publish`) and payout
+    /// (`payout::payout_tick`) both already operate purely off DB rows, not
+    /// off which engine created them, so nothing else needs to change for
+    /// those to pick this row up on their normal interval.
+    ///
+    /// Two deliberate simplifications, both documented here rather than
+    /// solved elaborately (see this task's scope note — matching existing
+    /// semantics safely beats inventing new ones):
+    ///
+    /// 1. **`response_hex` has no human-readable text behind it.** Unlike
+    ///    `OpoiEngine`, whose miners decode and hand back real text
+    ///    directly, this bridge has no tokenizer of its own (only the
+    ///    per-shard miners do, via their own GGUF vocab) — there is no
+    ///    on-bridge way to detokenize `generated_token_ids` into text. The
+    ///    on-chain commit/reveal/publish path only actually requires
+    ///    `response_hash == sha256(response_hex)` self-consistency (see
+    ///    `OpoiEngine::handle_submit_result`'s step 3 and this file's
+    ///    `sha256_hex` helper) — it never interprets the bytes — so
+    ///    `response_hex` here is instead the accumulated generated token
+    ///    ids, each encoded as 4 bytes little-endian, in generation order.
+    ///    This satisfies that requirement and is fully reproducible, but a
+    ///    downstream consumer that expects `submitopoicontent`'s published
+    ///    RESPONSE bytes to be human-readable text for a shard-routed
+    ///    request will need a detokenize step of its own (future work).
+    ///
+    /// 2. **Payout attribution picks ONE wallet, not a fair split.** A dense
+    ///    pipeline can genuinely involve several different downstream
+    ///    wallets (`dispatch_current` round-robins every shard dispatch
+    ///    across whoever is connected at that instant), but
+    ///    `opoi_submissions` only has room for one `miner_wallet` per row,
+    ///    and that's a hard constraint (one row = one on-chain
+    ///    commit/reveal/publish per `request_id`, enforced by
+    ///    `uq_opoi_submissions_active_request` — not just a DB nicety), not
+    ///    something this change should relax. `OpoiEngine`'s own existing
+    ///    semantics are actually already "single assignee gets 100%" (there
+    ///    is no N-way payment split anywhere in the whole-model path
+    ///    either — the stake-pool addresses used for commit/reveal are the
+    ///    bridge's own custodied identities, unrelated to downstream miner
+    ///    payment). Extending that same single-attribution model here as
+    ///    conservatively as possible: the wallet that delivered the MOST
+    ///    accepted shard-result steps for this request (see
+    ///    `PipelineState::contributions`) gets the full reward; ties break
+    ///    on wallet address ordering (arbitrary but deterministic). A fair
+    ///    proportional split across every contributing wallet would need
+    ///    either a schema change (a per-request payout-split table) or
+    ///    multiple payout rows keyed some other way than `request_id` —
+    ///    real future work, not a "guess elaborately" call for this pass.
+    async fn finalize_pipeline(&self, request_id: &str) {
+        let Some((_, pipeline)) = self.pipelines.remove(request_id) else { return };
+
+        let Some((winning_wallet, _)) = pipeline.contributions.iter().max_by_key(|(_, count)| **count) else {
+            tracing::error!(request_id = %request_id, "shard pipeline finished with no recorded contributions; cannot attribute payout, dropping");
+            return;
+        };
+        let winning_wallet = winning_wallet.clone();
+
+        let mut raw = Vec::with_capacity(pipeline.generated_token_ids.len() * 4);
+        for token_id in &pipeline.generated_token_ids {
+            raw.extend_from_slice(&token_id.to_le_bytes());
+        }
+        let response_hex = hex::encode(&raw);
+        let response_hash = sha256_hex(&raw);
+        let token_count = pipeline.generated_token_ids.len() as u32;
+
+        match db::repo::create_submission(
+            &self.db,
+            &winning_wallet,
+            request_id,
+            Some(&pipeline.manifest.model_id),
+            Some(&pipeline.prompt_hash),
+            None,
+            None,
+            &response_hash,
+            &response_hex,
+            token_count as i32,
+        )
+        .await
+        {
+            Ok(id) => {
+                tracing::info!(
+                    submission_id = id, request_id = %request_id, wallet = %winning_wallet, token_count,
+                    "shard pipeline response recorded; driving commit/reveal/publish (shared with OpoiEngine)"
+                );
+                let csd = self.csd.clone();
+                let db_pool = self.db.clone();
+                let stake_pool = self.stake_pool.clone();
+                let request_id = request_id.to_string();
+                tokio::spawn(async move {
+                    do_commit(csd, db_pool, stake_pool, id, request_id, response_hash, token_count).await;
+                });
+            }
+            Err(e) => {
+                tracing::error!(error = %e, request_id = %request_id, "failed to persist opoi_submissions row for completed shard pipeline; payout lost for this request");
+            }
+        }
+    }
 }
 
 #[async_trait::async_trait]
@@ -446,11 +598,10 @@ impl crate::opoi::handler::ShardHandler for ShardEngine {
     }
 }
 
-/// Only used by tests today (hashing isn't otherwise this module's job —
-/// `shard_compute.rs` on the miner side computes the real hash). Kept here
-/// so a future on-bridge sanity re-hash (defense in depth) has an obvious
-/// home if it's ever added.
-#[allow(dead_code)]
+/// Used by `finalize_pipeline` to hash the accumulated generated-token-id
+/// bytes into the on-chain `response_hash` (hashing isn't otherwise this
+/// module's job — `shard_compute.rs` on the miner side computes each
+/// shard's own output hash).
 fn sha256_hex(data: &[u8]) -> String {
     hex::encode(Sha256::digest(data))
 }

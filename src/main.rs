@@ -67,7 +67,7 @@ async fn main() -> anyhow::Result<()> {
     // real implementor for the proxy's session-level wiring below).
     let speculative_engine = Arc::new(SpeculativeEngine::new(csd.clone(), registry.clone(), stake_pool.clone(), DraftModelConfig::from_env()));
     let shard_engine = Arc::new(ShardEngine::new(
-        csd.clone(), registry.clone(), stake_pool.clone(), ModelSourceConfig::from_env(), Some(speculative_engine.clone()),
+        csd.clone(), db_pool.clone(), registry.clone(), stake_pool.clone(), ModelSourceConfig::from_env(), Some(speculative_engine.clone()),
     ));
 
     engine
