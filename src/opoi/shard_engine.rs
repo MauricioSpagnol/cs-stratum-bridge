@@ -534,18 +534,12 @@ impl ShardEngine {
     async fn finalize_pipeline(&self, request_id: &str) {
         let Some((_, pipeline)) = self.pipelines.remove(request_id) else { return };
 
-        let Some((winning_wallet, _)) = pipeline.contributions.iter().max_by_key(|(_, count)| **count) else {
+        let Some(winning_wallet) = select_winning_wallet(&pipeline.contributions) else {
             tracing::error!(request_id = %request_id, "shard pipeline finished with no recorded contributions; cannot attribute payout, dropping");
             return;
         };
-        let winning_wallet = winning_wallet.clone();
 
-        let mut raw = Vec::with_capacity(pipeline.generated_token_ids.len() * 4);
-        for token_id in &pipeline.generated_token_ids {
-            raw.extend_from_slice(&token_id.to_le_bytes());
-        }
-        let response_hex = hex::encode(&raw);
-        let response_hash = sha256_hex(&raw);
+        let (response_hash, response_hex) = build_response(&pipeline.generated_token_ids);
         let token_count = pipeline.generated_token_ids.len() as u32;
 
         match db::repo::create_submission(
@@ -604,4 +598,192 @@ impl crate::opoi::handler::ShardHandler for ShardEngine {
 /// shard's own output hash).
 fn sha256_hex(data: &[u8]) -> String {
     hex::encode(Sha256::digest(data))
+}
+
+/// Pure payout-attribution decision, extracted out of `finalize_pipeline` so
+/// it's testable without a live `PgPool`/`CsdRpcClient`. Picks whichever
+/// wallet delivered the most accepted shard-result steps (see
+/// `PipelineState::contributions`'s doc comment for why "most steps" is the
+/// attribution rule). `BTreeMap::iter()` yields entries in ascending key
+/// order, and `Iterator::max_by_key` keeps the LAST element it sees among
+/// ties — so when two or more wallets are tied for the highest count, the
+/// lexicographically GREATEST wallet address wins. That ordering is exactly
+/// what "arbitrary but deterministic" (finalize_pipeline's doc comment,
+/// simplification #2) refers to; this function and its tests pin the exact
+/// direction down. Returns `None` only when `contributions` is empty (a
+/// pipeline that finished with zero recorded contributions).
+fn select_winning_wallet(contributions: &BTreeMap<String, u32>) -> Option<String> {
+    contributions.iter().max_by_key(|(_, count)| **count).map(|(wallet, _)| wallet.clone())
+}
+
+/// Pure construction of the on-chain `(response_hash, response_hex)` pair
+/// from a pipeline's accumulated generated token ids, extracted out of
+/// `finalize_pipeline` so it's testable without a live `PgPool`. See
+/// `finalize_pipeline`'s doc comment (simplification #1) for why the byte
+/// encoding is each token id as 4 bytes little-endian, in generation order,
+/// rather than human-readable text.
+fn build_response(token_ids: &[u32]) -> (String /* response_hash */, String /* response_hex */) {
+    let mut raw = Vec::with_capacity(token_ids.len() * 4);
+    for token_id in token_ids {
+        raw.extend_from_slice(&token_id.to_le_bytes());
+    }
+    (sha256_hex(&raw), hex::encode(&raw))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ---- select_winning_wallet -------------------------------------------------
+
+    #[test]
+    fn winning_wallet_none_when_no_contributions() {
+        let contributions: BTreeMap<String, u32> = BTreeMap::new();
+        assert_eq!(select_winning_wallet(&contributions), None);
+    }
+
+    #[test]
+    fn winning_wallet_single_contributor_always_wins() {
+        let mut contributions = BTreeMap::new();
+        contributions.insert("wallet_only".to_string(), 1);
+        assert_eq!(select_winning_wallet(&contributions), Some("wallet_only".to_string()));
+    }
+
+    #[test]
+    fn winning_wallet_clear_majority_wins() {
+        let mut contributions = BTreeMap::new();
+        contributions.insert("wallet_a".to_string(), 3);
+        contributions.insert("wallet_b".to_string(), 9);
+        contributions.insert("wallet_c".to_string(), 1);
+        assert_eq!(select_winning_wallet(&contributions), Some("wallet_b".to_string()));
+    }
+
+    /// Pins down the exact tie-break direction: among wallets tied for the
+    /// highest step count, the lexicographically GREATEST address wins
+    /// (falls out of BTreeMap's ascending iteration + max_by_key keeping the
+    /// last-seen max). This is the behavior finalize_pipeline's doc comment
+    /// calls "arbitrary but deterministic" — this test makes the direction
+    /// explicit and regression-proof.
+    #[test]
+    fn winning_wallet_tie_breaks_toward_greatest_address() {
+        let mut contributions = BTreeMap::new();
+        contributions.insert("aaa_wallet".to_string(), 5);
+        contributions.insert("zzz_wallet".to_string(), 5);
+        contributions.insert("mmm_wallet".to_string(), 1); // not tied, should never win
+        assert_eq!(select_winning_wallet(&contributions), Some("zzz_wallet".to_string()));
+    }
+
+    #[test]
+    fn winning_wallet_three_way_tie_breaks_toward_greatest_address() {
+        let mut contributions = BTreeMap::new();
+        contributions.insert("aaa".to_string(), 5);
+        contributions.insert("bbb".to_string(), 5);
+        contributions.insert("ccc".to_string(), 5);
+        assert_eq!(select_winning_wallet(&contributions), Some("ccc".to_string()));
+    }
+
+    /// Confirms the tie-break is genuinely a property of key ordering, not
+    /// insertion order (BTreeMap always iterates by key regardless of
+    /// insertion sequence, but this makes that assumption explicit and
+    /// would catch a regression to an insertion-ordered map type).
+    #[test]
+    fn winning_wallet_tie_break_independent_of_insertion_order() {
+        let mut contributions = BTreeMap::new();
+        contributions.insert("zzz_wallet".to_string(), 5);
+        contributions.insert("aaa_wallet".to_string(), 5);
+        assert_eq!(select_winning_wallet(&contributions), Some("zzz_wallet".to_string()));
+    }
+
+    #[test]
+    fn winning_wallet_deterministic_across_repeated_calls() {
+        let mut contributions = BTreeMap::new();
+        contributions.insert("wallet_x".to_string(), 7);
+        contributions.insert("wallet_y".to_string(), 7);
+        let first = select_winning_wallet(&contributions);
+        for _ in 0..20 {
+            assert_eq!(select_winning_wallet(&contributions), first);
+        }
+    }
+
+    // ---- build_response ---------------------------------------------------------
+
+    #[test]
+    fn build_response_empty_tokens_is_empty_hex_of_empty_hash() {
+        let (hash, hex_str) = build_response(&[]);
+        assert_eq!(hex_str, "");
+        // Cross-checked independently against Sha256 over an empty input,
+        // not hardcoded, so this can't drift from the real algorithm.
+        let expected = hex::encode(Sha256::digest([]));
+        assert_eq!(hash, expected);
+    }
+
+    #[test]
+    fn build_response_is_deterministic_for_same_tokens() {
+        let tokens = vec![1u32, 2, 3, 42, 999_999];
+        let (hash1, hex1) = build_response(&tokens);
+        let (hash2, hex2) = build_response(&tokens);
+        assert_eq!(hash1, hash2);
+        assert_eq!(hex1, hex2);
+    }
+
+    #[test]
+    fn build_response_is_sensitive_to_token_differences() {
+        let (hash_a, hex_a) = build_response(&[1, 2, 3]);
+        let (hash_b, hex_b) = build_response(&[1, 2, 4]);
+        assert_ne!(hash_a, hash_b);
+        assert_ne!(hex_a, hex_b);
+    }
+
+    /// Order matters — the token sequence is generation order, and a
+    /// different order is a different response, so it must hash differently.
+    #[test]
+    fn build_response_is_sensitive_to_token_order() {
+        let (hash_a, hex_a) = build_response(&[1, 2, 3]);
+        let (hash_b, hex_b) = build_response(&[3, 2, 1]);
+        assert_ne!(hash_a, hash_b);
+        assert_ne!(hex_a, hex_b);
+    }
+
+    /// Pins the exact byte encoding down: each token id as 4 bytes
+    /// little-endian, concatenated in generation order — per
+    /// finalize_pipeline's doc comment. A change to big-endian, varint, or
+    /// any other encoding would break this without necessarily breaking
+    /// determinism/sensitivity tests above.
+    #[test]
+    fn build_response_hex_matches_expected_little_endian_encoding() {
+        let tokens = vec![1u32, 256, 65536, u32::MAX];
+        let (hash, hex_str) = build_response(&tokens);
+
+        let mut expected_raw = Vec::new();
+        for t in &tokens {
+            expected_raw.extend_from_slice(&t.to_le_bytes());
+        }
+        let expected_hex = hex::encode(&expected_raw);
+        assert_eq!(hex_str, expected_hex);
+        assert_eq!(hex_str.len(), tokens.len() * 8); // 4 bytes -> 8 hex chars per token
+
+        // response_hash must be sha256 of exactly the decoded response_hex
+        // bytes — this is the self-consistency property the on-chain
+        // commit/reveal path actually depends on (see finalize_pipeline's
+        // doc comment): response_hash == sha256(response_hex-decoded-bytes).
+        let decoded = hex::decode(&hex_str).unwrap();
+        assert_eq!(decoded, expected_raw);
+        let expected_hash = hex::encode(Sha256::digest(&expected_raw));
+        assert_eq!(hash, expected_hash);
+    }
+
+    #[test]
+    fn build_response_single_token_round_trips() {
+        let (hash, hex_str) = build_response(&[0x1234_5678]);
+        assert_eq!(hex_str, "78563412"); // little-endian byte order
+        let expected_hash = hex::encode(Sha256::digest([0x78, 0x56, 0x34, 0x12]));
+        assert_eq!(hash, expected_hash);
+    }
+
+    #[test]
+    fn build_response_length_scales_with_token_count() {
+        let tokens: Vec<u32> = (0..50).collect();
+        let (_, hex_str) = build_response(&tokens);
+        assert_eq!(hex_str.len(), tokens.len() * 8);
+    }
 }
