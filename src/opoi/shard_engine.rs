@@ -272,7 +272,7 @@ impl ShardEngine {
             if let Some(spec) = &self.speculative {
                 if spec.is_eligible(&manifest.model_id) {
                     tracing::info!(request_id = %req.request_id, model = %manifest.model_id, "dispatching via SpeculativeEngine (F15-L)");
-                    spec.start_pipeline(req.request_id.clone(), manifest, shards, req.max_tokens, prompt_hex.clone(), source).await;
+                    spec.start_pipeline(req.request_id.clone(), manifest, shards, req.max_tokens, prompt_hex.clone(), req.prompt_hash.clone(), source).await;
                     self.prompt_cache.remove(&req.request_id);
                     continue;
                 }

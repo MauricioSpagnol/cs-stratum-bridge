@@ -65,7 +65,7 @@ async fn main() -> anyhow::Result<()> {
     // an empty DraftModelConfig just makes `is_eligible` always false, same
     // end state as `None`, but this way `SpeculativeHandler` always has a
     // real implementor for the proxy's session-level wiring below).
-    let speculative_engine = Arc::new(SpeculativeEngine::new(csd.clone(), registry.clone(), stake_pool.clone(), DraftModelConfig::from_env()));
+    let speculative_engine = Arc::new(SpeculativeEngine::new(csd.clone(), db_pool.clone(), registry.clone(), stake_pool.clone(), DraftModelConfig::from_env()));
     let shard_engine = Arc::new(ShardEngine::new(
         csd.clone(), db_pool.clone(), registry.clone(), stake_pool.clone(), ModelSourceConfig::from_env(), Some(speculative_engine.clone()),
     ));

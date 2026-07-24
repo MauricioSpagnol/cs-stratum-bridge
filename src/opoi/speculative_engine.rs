@@ -70,14 +70,17 @@
 //!   `shard_engine.rs`'s own documented lack of restart-safe persistence —
 //!   Sessão 3 scope note in that file).
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use dashmap::DashMap;
 use parking_lot::Mutex;
+use sqlx::PgPool;
 
+use crate::db;
 use crate::miner_registry::MinerRegistry;
+use crate::opoi::engine::do_commit;
 use crate::opoi::shard_engine::ModelSource;
 use crate::opoi::wire::{
     build_draft_generate_line, build_kv_rollback_line, build_shard_assign_line, DraftInputWire, OpoiDraftGenerate, OpoiDraftResult,
@@ -210,6 +213,10 @@ struct SpecPipeline {
     source: ModelSource,
     draft_source: DraftModelSource,
     max_tokens: u32,
+    /// Carried through purely for the eventual `opoi_submissions` row (same
+    /// informational-only field `ShardEngine::PipelineState` fills from its
+    /// own `req.prompt_hash`) — not used for any pipeline-control decision.
+    prompt_hash: String,
     /// Stashed for round 0's draft-generate seed (`DraftInputWire::Prompt`)
     /// — by the time `Phase` has moved on to `AwaitingDraft`, the original
     /// `ShardInputWire::Prompt` it came from is gone.
@@ -225,6 +232,31 @@ struct SpecPipeline {
     k: u32,
     round: u32,
     phase: Phase,
+    /// The real verified/committed token-id output of the TARGET pipeline,
+    /// in generation order — accumulated at the end of every round (see
+    /// `handle_shard_result`'s verify-pass completion) as `draft_token_ids[
+    /// 0..accepted_count]` (the drafted tokens the target itself confirmed)
+    /// followed by that round's `settle_token` (the target's own real
+    /// inference output at the first diverging/continuing position — always
+    /// genuinely computed by the shard chain, never merely a draft guess).
+    /// This IS the response, mirroring `ShardEngine::PipelineState`'s own
+    /// `generated_token_ids` field and turned into `response_hex` the same
+    /// way (see `finalize_pipeline`'s doc comment) — the bridge has no
+    /// tokenizer of its own.
+    generated_token_ids: Vec<u32>,
+    /// Payout-attribution bookkeeping: how many accepted shard-relay steps
+    /// each wallet delivered for this request's TARGET pipeline (every
+    /// `opoi.shard_result` accepted in `handle_shard_result`, prompt
+    /// processing and verify passes alike). Deliberately does NOT include
+    /// the pinned draft-capable miner's own generate steps: the draft's
+    /// candidates never themselves become response content — only tokens
+    /// the target pipeline independently re-derives (accepted draft tokens
+    /// plus each round's `settle_token`) do, so payout for the actual
+    /// on-chain response follows the same "who computed it" rule
+    /// `ShardEngine` uses, not "who guessed it first". See
+    /// `finalize_pipeline`'s doc comment for how this resolves to the
+    /// single `miner_wallet` `opoi_submissions` requires.
+    contributions: BTreeMap<String, u32>,
 }
 
 #[derive(Default)]
@@ -235,6 +267,7 @@ struct ShardStepAssignment {
 
 pub struct SpeculativeEngine {
     csd: Arc<CsdRpcClient>,
+    db: PgPool,
     registry: Arc<MinerRegistry>,
     stake_pool: Arc<StakePool>,
     draft_sources: DraftModelConfig,
@@ -250,9 +283,10 @@ pub struct SpeculativeEngine {
 }
 
 impl SpeculativeEngine {
-    pub fn new(csd: Arc<CsdRpcClient>, registry: Arc<MinerRegistry>, stake_pool: Arc<StakePool>, draft_sources: DraftModelConfig) -> Self {
+    pub fn new(csd: Arc<CsdRpcClient>, db: PgPool, registry: Arc<MinerRegistry>, stake_pool: Arc<StakePool>, draft_sources: DraftModelConfig) -> Self {
         Self {
             csd,
+            db,
             registry,
             stake_pool,
             draft_sources,
@@ -285,7 +319,8 @@ impl SpeculativeEngine {
     /// non-speculative precondition (coordinator claim, dense-only graph,
     /// etc.) already passed there.
     pub async fn start_pipeline(
-        &self, request_id: String, manifest: ModelManifest, mut shards: Vec<ShardDescriptor>, max_tokens: u32, prompt_hex: String, source: ModelSource,
+        &self, request_id: String, manifest: ModelManifest, mut shards: Vec<ShardDescriptor>, max_tokens: u32, prompt_hex: String,
+        prompt_hash: String, source: ModelSource,
     ) {
         let Some(draft_source) = self.draft_sources.get(&manifest.model_id).cloned() else {
             tracing::warn!(request_id = %request_id, "SpeculativeEngine::start_pipeline called with no draft source configured — should not happen");
@@ -301,6 +336,7 @@ impl SpeculativeEngine {
                 source,
                 draft_source,
                 max_tokens,
+                prompt_hash,
                 prompt_hex: prompt_hex.clone(),
                 draft_wallet: None,
                 base: 0,
@@ -309,6 +345,8 @@ impl SpeculativeEngine {
                 k: 4,
                 round: 0,
                 phase: Phase::PromptProcessing { pos: 0, current_input: ShardInputWire::Prompt { prompt_hex } },
+                generated_token_ids: Vec::new(),
+                contributions: BTreeMap::new(),
             },
         );
         self.dispatch_shard_step(&request_id).await;
@@ -409,6 +447,14 @@ impl SpeculativeEngine {
         }
         self.shard_assignments.remove(&request_id);
 
+        // Payout-attribution bookkeeping (see `SpecPipeline::contributions`
+        // doc comment): every accepted shard-relay result — prompt
+        // processing or verify pass, any shard in the chain — is one real
+        // unit of target-pipeline compute delivered by `wallet`.
+        if let Some(mut pipeline) = self.pipelines.get_mut(&request_id) {
+            *pipeline.contributions.entry(wallet.to_string()).or_insert(0) += 1;
+        }
+
         let is_last_shard = {
             let Some(pipeline) = self.pipelines.get(&request_id) else { return Err(crate::error::AppError::UnknownRequest) };
             let pos = match &pipeline.phase {
@@ -497,6 +543,16 @@ impl SpeculativeEngine {
         let keep_len = kv_keep_len(base, carry, outcome.accepted_count);
         let is_finalizing_round = (base + outcome.accepted_count + 1) as u32 >= max_tokens;
         let round = self.pipelines.get(&request_id).map(|p| p.round).unwrap_or(0);
+
+        // This round's real generated output — see `SpecPipeline::
+        // generated_token_ids` doc comment for why it's exactly the
+        // accepted drafted tokens plus the settle token, and why both are
+        // genuinely target-computed (not merely drafted) regardless of
+        // whether this turns out to be the finalizing round.
+        if let Some(mut pipeline) = self.pipelines.get_mut(&request_id) {
+            pipeline.generated_token_ids.extend_from_slice(&draft_token_ids[..outcome.accepted_count]);
+            pipeline.generated_token_ids.push(outcome.settle_token);
+        }
 
         tracing::info!(
             request_id = %request_id, round,
@@ -690,8 +746,8 @@ impl SpeculativeEngine {
         };
 
         if is_finalizing_round {
-            tracing::info!(request_id = %request_id, "speculative: pipeline finished (max_tokens reached)");
-            self.pipelines.remove(&request_id);
+            tracing::info!(request_id = %request_id, "speculative: pipeline finished (max_tokens reached); driving commit/reveal/publish/payout");
+            self.finalize_pipeline(&request_id).await;
             return;
         }
 
@@ -703,6 +759,90 @@ impl SpeculativeEngine {
             pipeline.phase = Phase::AwaitingDraft;
         }
         self.dispatch_draft(&request_id).await;
+    }
+
+    /// Drives a just-completed speculative pipeline's response through the
+    /// SAME commit -> reveal -> publish -> payout lifecycle `OpoiEngine`
+    /// (whole-model) and `ShardEngine` (plain per-token shard relay)
+    /// already have working, by writing the same `opoi_submissions` row
+    /// shape they do and handing off to the shared `engine::do_commit` (see
+    /// that function's doc comment) — reveal/publish
+    /// (`OpoiEngine::poll_reveal_tick`/`do_publish`) and payout
+    /// (`payout::payout_tick`) both already operate purely off DB rows, not
+    /// off which engine created them, so nothing else needs to change for
+    /// those to pick this row up on their normal interval. Mirrors
+    /// `ShardEngine::finalize_pipeline` as closely as this module's
+    /// multi-round (rather than single-shard-relay) structure allows — see
+    /// that function's doc comment for the two ambiguities resolved
+    /// identically here:
+    ///
+    /// 1. **`response_hex` has no human-readable text behind it** — same
+    ///    reasoning as `ShardEngine::finalize_pipeline`: this bridge has no
+    ///    tokenizer of its own (only the per-shard AND draft miners do), so
+    ///    `response_hex` is the accumulated `generated_token_ids`, each
+    ///    encoded as 4 bytes little-endian, in generation order.
+    ///
+    /// 2. **Payout attribution picks ONE wallet, not a fair split** — same
+    ///    "most accepted steps wins, ties break on address ordering" rule
+    ///    as `ShardEngine`, applied to `SpecPipeline::contributions`. Unlike
+    ///    `ShardEngine`, this module has a SECOND role in the mix (the
+    ///    pinned draft-capable miner, tracked separately as
+    ///    `pipeline.draft_wallet`) — deliberately excluded from
+    ///    `contributions` and therefore never eligible to win this
+    ///    attribution: the draft's own candidate tokens never themselves
+    ///    become response content, only tokens the target pipeline
+    ///    independently re-derives do (see `contributions`' doc comment), so
+    ///    a draft-only contributor has done zero response-producing work by
+    ///    this rule, exactly like a miner that connected but was never
+    ///    assigned a shard in `ShardEngine`'s world.
+    async fn finalize_pipeline(&self, request_id: &str) {
+        let Some((_, pipeline)) = self.pipelines.remove(request_id) else { return };
+
+        let Some((winning_wallet, _)) = pipeline.contributions.iter().max_by_key(|(_, count)| **count) else {
+            tracing::error!(request_id = %request_id, "speculative pipeline finished with no recorded contributions; cannot attribute payout, dropping");
+            return;
+        };
+        let winning_wallet = winning_wallet.clone();
+
+        let mut raw = Vec::with_capacity(pipeline.generated_token_ids.len() * 4);
+        for token_id in &pipeline.generated_token_ids {
+            raw.extend_from_slice(&token_id.to_le_bytes());
+        }
+        let response_hex = hex::encode(&raw);
+        let response_hash = hex::encode(<sha2::Sha256 as sha2::Digest>::digest(&raw));
+        let token_count = pipeline.generated_token_ids.len() as u32;
+
+        match db::repo::create_submission(
+            &self.db,
+            &winning_wallet,
+            request_id,
+            Some(&pipeline.manifest.model_id),
+            Some(&pipeline.prompt_hash),
+            None,
+            None,
+            &response_hash,
+            &response_hex,
+            token_count as i32,
+        )
+        .await
+        {
+            Ok(id) => {
+                tracing::info!(
+                    submission_id = id, request_id = %request_id, wallet = %winning_wallet, token_count,
+                    "speculative pipeline response recorded; driving commit/reveal/publish (shared with OpoiEngine/ShardEngine)"
+                );
+                let csd = self.csd.clone();
+                let db_pool = self.db.clone();
+                let stake_pool = self.stake_pool.clone();
+                let request_id = request_id.to_string();
+                tokio::spawn(async move {
+                    do_commit(csd, db_pool, stake_pool, id, request_id, response_hash, token_count).await;
+                });
+            }
+            Err(e) => {
+                tracing::error!(error = %e, request_id = %request_id, "failed to persist opoi_submissions row for completed speculative pipeline; payout lost for this request");
+            }
+        }
     }
 
     pub async fn on_disconnect(&self, wallet: &str) {
