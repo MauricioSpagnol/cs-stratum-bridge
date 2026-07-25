@@ -76,6 +76,28 @@ pub struct Submission {
     pub updated_at: DateTime<Utc>,
 }
 
+/// A B3-lite served-response receipt — see `opoi/b3lite.rs`'s module doc
+/// and migration `0003_b3lite.sql`.
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct B3LiteReceipt {
+    pub id: i64,
+    pub request_id: String,
+    pub miner_wallet: String,
+    pub model_id: String,
+    pub gguf_sha256: String,
+    pub prompt_hash: Option<String>,
+    pub prompt_hex: String,
+    pub response_hash: String,
+    pub generated_token_ids_hex: String,
+    pub total_layers: i32,
+    pub signature_hex: String,
+    pub sampled: bool,
+    pub audit_status: String,
+    pub audit_detail: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub audited_at: Option<DateTime<Utc>>,
+}
+
 /// A commit attempt (see `stake_pool.rs`/migration `0002_commit_attempts.sql`
 /// for why a submission can have more than one) joined with the fields of
 /// its parent submission needed to attempt a reveal — what

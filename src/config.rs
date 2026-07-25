@@ -84,6 +84,38 @@ pub struct Config {
 
     #[arg(long, env = "PAYOUT_INTERVAL_MS", default_value_t = 3_600_000)]
     pub payout_interval_ms: u64,
+
+    /// B3-lite (see opoi/b3lite.rs): HMAC-SHA256 key for signing served-
+    /// response receipts. Empty (the default) means B3-lite receipts are
+    /// unsigned/disabled — `Config::b3lite_enabled` gates on this.
+    #[arg(long, env = "B3LITE_RECEIPT_SECRET", default_value = "")]
+    pub b3lite_receipt_secret: String,
+
+    /// Fraction (0.0-1.0) of manifest-pinned (shard-routed) served
+    /// responses randomly selected for a real Auditor replay — see
+    /// `opoi/b3lite.rs`'s `should_sample` for the deterministic (hash-based,
+    /// not RNG-based) selection rule.
+    #[arg(long, env = "B3LITE_AUDIT_SAMPLE_RATE", default_value_t = 0.05)]
+    pub b3lite_audit_sample_rate: f64,
+
+    /// Path to a `cs-miner` binary this bridge invokes as a subprocess to
+    /// run the Auditor replay (`cs-miner --audit-request <file>`) — see
+    /// `opoi/b3lite_audit.rs`. Deliberately a LOCAL subprocess the bridge
+    /// operator controls, not a stratum round-trip to an arbitrary
+    /// connected miner: trusting a peer miner to audit another peer miner
+    /// gives no real security margin for an off-chain-only consequence
+    /// (see the B3-lite scope doc's design note on this).
+    #[arg(long, env = "AUDITOR_CS_MINER_BIN", default_value = "cs-miner")]
+    pub auditor_cs_miner_bin: String,
+
+    /// Scratch directory the Auditor subprocess downloads/caches GGUFs and
+    /// tokenizers into (its own `gguf_fetch` cache — separate from any
+    /// miner's own cache dir).
+    #[arg(long, env = "AUDITOR_CACHE_DIR", default_value = "./auditor_cache")]
+    pub auditor_cache_dir: String,
+
+    #[arg(long, env = "B3LITE_AUDIT_POLL_INTERVAL_MS", default_value_t = 30_000)]
+    pub b3lite_audit_poll_interval_ms: u64,
 }
 
 impl Config {
@@ -111,6 +143,13 @@ impl Config {
         } else {
             &self.payout_address
         }
+    }
+
+    /// B3-lite is opt-in: no receipt secret configured means no receipts are
+    /// signed/recorded/sampled at all (rather than silently signing with an
+    /// empty key, which would be a receipt anyone could forge).
+    pub fn b3lite_enabled(&self) -> bool {
+        !self.b3lite_receipt_secret.is_empty()
     }
 
     pub fn load() -> Self {

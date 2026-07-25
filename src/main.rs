@@ -13,6 +13,7 @@ mod state;
 use std::sync::Arc;
 use std::time::Duration;
 
+use opoi::b3lite_audit::B3LiteAuditor;
 use opoi::handler::{OpoiHandler, ShardHandler, SpeculativeHandler};
 use opoi::shard_engine::ModelSourceConfig;
 use opoi::speculative_engine::DraftModelConfig;
@@ -66,8 +67,13 @@ async fn main() -> anyhow::Result<()> {
     // end state as `None`, but this way `SpeculativeHandler` always has a
     // real implementor for the proxy's session-level wiring below).
     let speculative_engine = Arc::new(SpeculativeEngine::new(csd.clone(), db_pool.clone(), registry.clone(), stake_pool.clone(), DraftModelConfig::from_env()));
+    let b3lite_cfg = opoi::b3lite::B3LiteConfig::from_config(&cfg);
+    if b3lite_cfg.is_none() {
+        tracing::info!("B3LITE_RECEIPT_SECRET not set — B3-lite receipts/sampling/audit disabled");
+    }
     let shard_engine = Arc::new(ShardEngine::new(
         csd.clone(), db_pool.clone(), registry.clone(), stake_pool.clone(), ModelSourceConfig::from_env(), Some(speculative_engine.clone()),
+        b3lite_cfg.clone(),
     ));
 
     engine
@@ -119,6 +125,30 @@ async fn main() -> anyhow::Result<()> {
             }
         }
     });
+
+    // B3-lite (see opoi/b3lite_audit.rs): only actually runs anything once
+    // both a receipt secret is configured AND at least one sampled receipt
+    // exists to audit — a disabled config just means `audit_tick` finds
+    // nothing pending every time (no receipts are ever recorded without
+    // `b3lite_cfg`, see ShardEngine::record_b3lite_receipt).
+    if b3lite_cfg.is_some() {
+        let b3lite_auditor = Arc::new(B3LiteAuditor::new(
+            db_pool.clone(),
+            ModelSourceConfig::from_env(),
+            registry.clone(),
+            cfg.auditor_cs_miner_bin.clone(),
+            std::path::PathBuf::from(&cfg.auditor_cache_dir),
+        ));
+        spawn_interval(cfg.b3lite_audit_poll_interval_ms, {
+            let b3lite_auditor = b3lite_auditor.clone();
+            move || {
+                let b3lite_auditor = b3lite_auditor.clone();
+                async move {
+                    b3lite_auditor.audit_tick().await;
+                }
+            }
+        });
+    }
 
     spawn_interval(cfg.reveal_poll_interval_ms, {
         let engine = engine.clone();

@@ -24,6 +24,17 @@ pub struct MinerRegistry {
     /// `unregister` regardless of whether it was ever marked, same as any
     /// other per-connection state.
     draft_capable: Mutex<HashSet<String>>,
+    /// B3-lite (see `opoi/b3lite_audit.rs`'s "EJECTED" consequence): wallets
+    /// excluded from future OPoI dispatch after repeated confirmed-fraud
+    /// audits. Deliberately NOT removed from `inner` and NOT disconnected —
+    /// PoW `mining.*` traffic is unaffected; only `pick_next`/
+    /// `pick_draft_capable` skip a banned wallet, so it simply never
+    /// receives another OPoI assignment. Persists only for this process's
+    /// lifetime (in-memory, like `draft_capable`) — a restart currently
+    /// forgets bans; see `b3lite_audit.rs`'s consequence table for the
+    /// durable record this could be rebuilt from at startup (not done in
+    /// this pass).
+    banned: Mutex<HashSet<String>>,
 }
 
 impl MinerRegistry {
@@ -31,7 +42,19 @@ impl MinerRegistry {
         Self {
             inner: Mutex::new(IndexMap::new()),
             draft_capable: Mutex::new(HashSet::new()),
+            banned: Mutex::new(HashSet::new()),
         }
+    }
+
+    /// Excludes `wallet` from all future `pick_next`/`pick_draft_capable`
+    /// selections — see `banned`'s doc comment for the exact scope (OPoI
+    /// dispatch only, PoW mining unaffected).
+    pub fn ban(&self, wallet: &str) {
+        self.banned.lock().insert(wallet.to_string());
+    }
+
+    pub fn is_banned(&self, wallet: &str) -> bool {
+        self.banned.lock().contains(wallet)
     }
 
     pub fn register(&self, wallet: String, tx: UnboundedSender<String>) {
@@ -53,21 +76,26 @@ impl MinerRegistry {
     }
 
     /// Round-robin: returns the wallet after `last` in insertion order,
-    /// wrapping around. If `last` is None, or `last` is no longer
-    /// registered (miner disconnected), falls back to the FIRST
-    /// currently-registered wallet. Returns None if nothing is registered.
+    /// wrapping around, skipping any B3-lite-banned wallet (see `banned`'s
+    /// doc comment). If `last` is None, or `last` is no longer registered
+    /// (miner disconnected), falls back to the FIRST currently-registered,
+    /// non-banned wallet. Returns None if nothing is registered, or every
+    /// registered wallet is banned.
     pub fn pick_next(&self, last: &Option<String>) -> Option<String> {
         let inner = self.inner.lock();
         if inner.is_empty() {
             return None;
         }
+        let banned = self.banned.lock();
 
-        let next_idx = match last.as_ref().and_then(|wallet| inner.get_index_of(wallet)) {
+        let start_idx = match last.as_ref().and_then(|wallet| inner.get_index_of(wallet)) {
             Some(idx) => (idx + 1) % inner.len(),
             None => 0,
         };
 
-        inner.get_index(next_idx).map(|(wallet, _)| wallet.clone())
+        (0..inner.len())
+            .map(|offset| (start_idx + offset) % inner.len())
+            .find_map(|idx| inner.get_index(idx).filter(|(wallet, _)| !banned.contains(wallet.as_str())).map(|(wallet, _)| wallet.clone()))
     }
 
     /// F17-D: records that `wallet` announced the `draft` capability
@@ -94,6 +122,7 @@ impl MinerRegistry {
         if inner.is_empty() || draft_capable.is_empty() {
             return None;
         }
+        let banned = self.banned.lock();
 
         let start_idx = match last.as_ref().and_then(|wallet| inner.get_index_of(wallet)) {
             Some(idx) => (idx + 1) % inner.len(),
@@ -102,7 +131,12 @@ impl MinerRegistry {
 
         (0..inner.len())
             .map(|offset| (start_idx + offset) % inner.len())
-            .find_map(|idx| inner.get_index(idx).filter(|(wallet, _)| draft_capable.contains(wallet.as_str())).map(|(wallet, _)| wallet.clone()))
+            .find_map(|idx| {
+                inner
+                    .get_index(idx)
+                    .filter(|(wallet, _)| draft_capable.contains(wallet.as_str()) && !banned.contains(wallet.as_str()))
+                    .map(|(wallet, _)| wallet.clone())
+            })
     }
 }
 

@@ -11,7 +11,7 @@ use sqlx::{PgPool, Row};
 
 use crate::error::AppError;
 
-use super::models::{RevealCandidate, Submission};
+use super::models::{B3LiteReceipt, RevealCandidate, Submission};
 
 /// Inserts a new submission row with `status = 'RECEIVED'` and returns its
 /// generated id.
@@ -208,9 +208,19 @@ pub async fn list_revealed_unpublished(pool: &PgPool) -> Result<Vec<Submission>,
 /// Returns every published, not-yet-paid submission — used by the payout
 /// loop, which needs both the amount and the request_id (to mark exactly
 /// the rows that were folded into a payout tx as paid) per miner wallet.
+///
+/// Excludes any `request_id` under an active B3-lite `WITHHOLD_PAY`
+/// consequence (see `insert_b3lite_consequence`/`b3lite_audit.rs`) — a
+/// confirmed-divergent response stays unpaid indefinitely (no automatic
+/// un-withhold: this is a manual-review off-chain consequence, on-chain
+/// consensus/settlement for the request itself is untouched either way).
 pub async fn list_unpaid_published(pool: &PgPool) -> Result<Vec<Submission>, AppError> {
     let submissions = sqlx::query_as::<_, Submission>(
-        r#"SELECT * FROM opoi_submissions WHERE status = 'PUBLISHED' AND paid = false"#,
+        r#"
+        SELECT * FROM opoi_submissions
+        WHERE status = 'PUBLISHED' AND paid = false
+          AND request_id NOT IN (SELECT request_id FROM b3lite_consequences WHERE action = 'WITHHOLD_PAY')
+        "#,
     )
     .fetch_all(pool)
     .await?;
@@ -374,6 +384,132 @@ pub async fn mark_attempt_revealed(pool: &PgPool, attempt_id: i64, reveal_txid: 
     Ok(())
 }
 
+// ---- B3-lite (see opoi/b3lite.rs / b3lite_audit.rs) ------------------------
+
+/// Persists a served-response receipt — called once per manifest-pinned
+/// (shard-routed) response, whether or not it ends up `sampled` (see
+/// `b3lite::should_sample`). Returns the new row's id.
+#[allow(clippy::too_many_arguments)]
+pub async fn create_b3lite_receipt(
+    pool: &PgPool,
+    request_id: &str,
+    miner_wallet: &str,
+    model_id: &str,
+    gguf_sha256: &str,
+    prompt_hash: Option<&str>,
+    prompt_hex: &str,
+    response_hash: &str,
+    generated_token_ids_hex: &str,
+    total_layers: i32,
+    signature_hex: &str,
+    sampled: bool,
+) -> Result<i64, AppError> {
+    let audit_status = if sampled { "PENDING" } else { "NONE" };
+    let row = sqlx::query(
+        r#"
+        INSERT INTO b3lite_receipts
+            (request_id, miner_wallet, model_id, gguf_sha256, prompt_hash, prompt_hex,
+             response_hash, generated_token_ids_hex, total_layers, signature_hex, sampled, audit_status)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+        RETURNING id
+        "#,
+    )
+    .bind(request_id)
+    .bind(miner_wallet)
+    .bind(model_id)
+    .bind(gguf_sha256)
+    .bind(prompt_hash)
+    .bind(prompt_hex)
+    .bind(response_hash)
+    .bind(generated_token_ids_hex)
+    .bind(total_layers)
+    .bind(signature_hex)
+    .bind(sampled)
+    .bind(audit_status)
+    .fetch_one(pool)
+    .await?;
+
+    Ok(row.try_get::<i64, _>("id")?)
+}
+
+/// Receipts sampled for audit whose audit hasn't run yet — what
+/// `b3lite_audit::audit_tick` iterates.
+pub async fn list_pending_b3lite_audits(pool: &PgPool) -> Result<Vec<B3LiteReceipt>, AppError> {
+    let rows = sqlx::query_as::<_, B3LiteReceipt>(
+        r#"SELECT * FROM b3lite_receipts WHERE sampled = TRUE AND audit_status = 'PENDING'"#,
+    )
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows)
+}
+
+/// Records a completed audit run's outcome — `status` must be one of
+/// `ADMISSIBLE` / `DIVERGENT` / `INCONCLUSIVE` (see migration doc).
+pub async fn mark_b3lite_audit_result(
+    pool: &PgPool,
+    receipt_id: i64,
+    status: &str,
+    detail: &str,
+) -> Result<(), AppError> {
+    sqlx::query(
+        r#"
+        UPDATE b3lite_receipts
+        SET audit_status = $1, audit_detail = $2, audited_at = NOW()
+        WHERE id = $3
+        "#,
+    )
+    .bind(status)
+    .bind(detail)
+    .bind(receipt_id)
+    .execute(pool)
+    .await?;
+
+    Ok(())
+}
+
+/// Appends an off-chain consequence row — see migration doc for the three
+/// `action` values and `b3lite_audit.rs` for the policy that decides which
+/// ones fire on a confirmed divergence.
+pub async fn insert_b3lite_consequence(
+    pool: &PgPool,
+    receipt_id: i64,
+    miner_wallet: &str,
+    request_id: &str,
+    action: &str,
+    reason: &str,
+) -> Result<(), AppError> {
+    sqlx::query(
+        r#"
+        INSERT INTO b3lite_consequences (receipt_id, miner_wallet, request_id, action, reason)
+        VALUES ($1, $2, $3, $4, $5)
+        "#,
+    )
+    .bind(receipt_id)
+    .bind(miner_wallet)
+    .bind(request_id)
+    .bind(action)
+    .bind(reason)
+    .execute(pool)
+    .await?;
+
+    Ok(())
+}
+
+/// Total `WITHHOLD_PAY` consequences ever recorded for `miner_wallet` —
+/// used by the consequence policy to decide whether a repeat offender
+/// should now also be `EJECTED` (see `b3lite_audit.rs`).
+pub async fn count_withhold_consequences(pool: &PgPool, miner_wallet: &str) -> Result<i64, AppError> {
+    let row = sqlx::query(
+        r#"SELECT COUNT(*) AS n FROM b3lite_consequences WHERE miner_wallet = $1 AND action = 'WITHHOLD_PAY'"#,
+    )
+    .bind(miner_wallet)
+    .fetch_one(pool)
+    .await?;
+
+    Ok(row.try_get::<i64, _>("n")?)
+}
+
 /// Appends an entry to the stake-event audit log.
 pub async fn log_stake_event(
     pool: &PgPool,
@@ -394,4 +530,95 @@ pub async fn log_stake_event(
     .await?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod b3lite_repo_tests {
+    //! Live-DB smoke test for the B3-lite repo functions above — this
+    //! module's own doc comment explains why these use the runtime-checked
+    //! query API instead of compile-time-checked macros (no `DATABASE_URL`
+    //! needed to COMPILE), but that also means nothing validates the SQL
+    //! itself actually runs until something executes it against a real
+    //! Postgres. Gated on `B3LITE_TEST_DATABASE_URL` (a throwaway/scratch
+    //! database, migrated fresh — never point this at a real deployment's
+    //! DB) so a normal `cargo test` with no such env var set just skips it
+    //! rather than failing everyone else's run.
+    use super::*;
+
+    async fn test_pool() -> Option<PgPool> {
+        let url = std::env::var("B3LITE_TEST_DATABASE_URL").ok()?;
+        let pool = sqlx::postgres::PgPoolOptions::new().max_connections(2).connect(&url).await.expect("connect to test DB");
+        sqlx::migrate!("./migrations").run(&pool).await.expect("run migrations against test DB");
+        Some(pool)
+    }
+
+    #[tokio::test]
+    async fn b3lite_receipt_and_consequence_lifecycle() {
+        let Some(pool) = test_pool().await else {
+            eprintln!("B3LITE_TEST_DATABASE_URL not set — skipping live-DB smoke test");
+            return;
+        };
+
+        let request_id = format!("test-req-{}", uuid::Uuid::new_v4());
+        let wallet = "test-wallet-a";
+
+        // Not sampled — should never show up in list_pending_b3lite_audits.
+        let unsampled_id = create_b3lite_receipt(
+            &pool, &request_id, wallet, "QWEN2_5_0_5B", "deadbeef", Some("promptash"), "70726f6d7074",
+            "resphash", "0100000002000000", 24, "sig-unsampled", false,
+        ).await.expect("create unsampled receipt");
+
+        let sampled_request_id = format!("test-req-{}", uuid::Uuid::new_v4());
+        let sampled_id = create_b3lite_receipt(
+            &pool, &sampled_request_id, wallet, "QWEN2_5_0_5B", "deadbeef", Some("promptash"), "70726f6d7074",
+            "resphash2", "0300000004000000", 24, "sig-sampled", true,
+        ).await.expect("create sampled receipt");
+
+        let pending = list_pending_b3lite_audits(&pool).await.expect("list pending");
+        assert!(pending.iter().any(|r| r.id == sampled_id), "sampled receipt should be pending audit");
+        assert!(!pending.iter().any(|r| r.id == unsampled_id), "unsampled receipt should never be pending audit");
+
+        let sampled_row = pending.iter().find(|r| r.id == sampled_id).unwrap();
+        assert_eq!(sampled_row.audit_status, "PENDING");
+        assert_eq!(sampled_row.request_id, sampled_request_id);
+        assert_eq!(sampled_row.generated_token_ids_hex, "0300000004000000");
+        assert!(sampled_row.sampled);
+
+        mark_b3lite_audit_result(&pool, sampled_id, "DIVERGENT", "{\"positions\":[]}").await.expect("mark audit result");
+        let pending_after = list_pending_b3lite_audits(&pool).await.expect("list pending after mark");
+        assert!(!pending_after.iter().any(|r| r.id == sampled_id), "no longer pending once audited");
+
+        insert_b3lite_consequence(&pool, sampled_id, wallet, &sampled_request_id, "WITHHOLD_PAY", "test divergence")
+            .await
+            .expect("insert consequence");
+        let count = count_withhold_consequences(&pool, wallet).await.expect("count consequences");
+        assert!(count >= 1);
+
+        // create_submission + list_unpaid_published: the withheld request_id
+        // must be excluded even though it's PUBLISHED and unpaid.
+        let submission_id = create_submission(
+            &pool, wallet, &sampled_request_id, Some("QWEN2_5_0_5B"), Some("promptash"), None, None, "resphash2",
+            "0300000004000000", 2,
+        ).await.expect("create submission");
+        mark_published(&pool, submission_id, 1.5).await.expect("mark published");
+
+        let unpaid = list_unpaid_published(&pool).await.expect("list unpaid published");
+        assert!(
+            !unpaid.iter().any(|s| s.request_id == sampled_request_id),
+            "a request_id under an active WITHHOLD_PAY consequence must be excluded from payout"
+        );
+
+        // A DIFFERENT, non-withheld request should still show up normally.
+        let other_request_id = format!("test-req-{}", uuid::Uuid::new_v4());
+        let other_submission_id = create_submission(
+            &pool, wallet, &other_request_id, Some("QWEN2_5_0_5B"), Some("promptash"), None, None, "resphash3",
+            "0500000006000000", 2,
+        ).await.expect("create other submission");
+        mark_published(&pool, other_submission_id, 1.5).await.expect("mark other published");
+        let unpaid_after = list_unpaid_published(&pool).await.expect("list unpaid published again");
+        assert!(
+            unpaid_after.iter().any(|s| s.request_id == other_request_id),
+            "a non-withheld published+unpaid request should still be returned"
+        );
+    }
 }

@@ -474,6 +474,7 @@ dependencies = [
  "dotenvy",
  "futures",
  "hex",
+ "hmac",
  "indexmap",
  "parking_lot",
  "reqwest",

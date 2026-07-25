@@ -42,6 +42,7 @@ use sqlx::PgPool;
 
 use crate::db;
 use crate::miner_registry::MinerRegistry;
+use crate::opoi::b3lite::{self, B3LiteConfig};
 use crate::opoi::engine::do_commit;
 use crate::opoi::speculative_engine::SpeculativeEngine;
 use crate::opoi::wire::{build_shard_assign_line, OpoiShardAssign, ShardInputWire, ShardOutputWire};
@@ -55,6 +56,7 @@ use crate::stake_pool::StakePool;
 /// JSON object `{"MODEL_ID": {"gguf_url": "...", "tokenizer_url": "..."}}`).
 /// A model with no entry here simply never gets shard-dispatched (treated
 /// the same as "no manifest" by callers).
+#[derive(Clone)]
 pub struct ModelSourceConfig {
     sources: std::collections::HashMap<String, ModelSource>,
 }
@@ -109,6 +111,13 @@ struct PipelineState {
     /// re-dispatch (e.g. after a miner disconnects mid-shard) can resend
     /// the identical assignment instead of needing to reconstruct it.
     current_input: ShardInputWire,
+    /// The ENTRY shard's original prompt, hex-encoded — captured once at
+    /// pipeline creation and never overwritten (unlike `current_input`,
+    /// which becomes `NextTokenId`/`Tensor` as generation advances). Needed
+    /// at `finalize_pipeline` time to record a B3-lite receipt: a later
+    /// audit replay must re-tokenize the SAME prompt this pipeline was
+    /// actually served with (see `b3lite.rs`'s module doc).
+    original_prompt_hex: String,
     /// The real decoded-token-id output of the LAST shard at every token
     /// step, in generation order — this IS the response, accumulated as it
     /// arrives (see `handle_shard_result_inner`). The bridge has no
@@ -171,12 +180,17 @@ pub struct ShardEngine {
     /// speculatively-dispatched request_id is likewise forwarded to it
     /// (see `handle_shard_result_inner`) instead of processed here.
     speculative: Option<Arc<SpeculativeEngine>>,
+    /// `None` when B3-lite is disabled (`Config::b3lite_enabled` false) —
+    /// `finalize_pipeline` records no receipt at all in that case, rather
+    /// than recording an unsigned one (see `B3LiteConfig`'s doc).
+    b3lite: Option<B3LiteConfig>,
 }
 
 impl ShardEngine {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         csd: Arc<CsdRpcClient>, db: PgPool, registry: Arc<MinerRegistry>, stake_pool: Arc<StakePool>, model_sources: ModelSourceConfig,
-        speculative: Option<Arc<SpeculativeEngine>>,
+        speculative: Option<Arc<SpeculativeEngine>>, b3lite: Option<B3LiteConfig>,
     ) -> Self {
         Self {
             csd,
@@ -189,6 +203,7 @@ impl ShardEngine {
             last_assigned: Mutex::new(None),
             prompt_cache: DashMap::new(),
             speculative,
+            b3lite,
         }
     }
 
@@ -288,6 +303,7 @@ impl ShardEngine {
                     pos: 0,
                     token_index: 0,
                     current_input: ShardInputWire::Prompt { prompt_hex: prompt_hex.clone() },
+                    original_prompt_hex: prompt_hex.clone(),
                     generated_token_ids: Vec::new(),
                     contributions: BTreeMap::new(),
                 },
@@ -542,6 +558,10 @@ impl ShardEngine {
         let (response_hash, response_hex) = build_response(&pipeline.generated_token_ids);
         let token_count = pipeline.generated_token_ids.len() as u32;
 
+        if let Some(b3lite_cfg) = &self.b3lite {
+            self.record_b3lite_receipt(b3lite_cfg, request_id, &winning_wallet, &pipeline, &response_hash).await;
+        }
+
         match db::repo::create_submission(
             &self.db,
             &winning_wallet,
@@ -571,6 +591,67 @@ impl ShardEngine {
             }
             Err(e) => {
                 tracing::error!(error = %e, request_id = %request_id, "failed to persist opoi_submissions row for completed shard pipeline; payout lost for this request");
+            }
+        }
+    }
+
+    /// B3-lite (see `b3lite.rs`'s module doc): signs and persists a served-
+    /// response receipt for a just-finished manifest-pinned pipeline, and
+    /// decides whether it gets queued for a real Auditor replay. Best-
+    /// effort — a failure here only means this response wasn't recorded/
+    /// sampled for B3-lite, never blocks the on-chain commit/reveal/publish
+    /// path `finalize_pipeline` drives regardless (see the B3-lite scope
+    /// doc: no consensus change, this is purely additional off-chain
+    /// bookkeeping).
+    async fn record_b3lite_receipt(
+        &self,
+        cfg: &B3LiteConfig,
+        request_id: &str,
+        miner_wallet: &str,
+        pipeline: &PipelineState,
+        response_hash: &str,
+    ) {
+        let gguf_sha256 = &pipeline.manifest.backbone_pom_root;
+        let generated_token_ids_hex = {
+            let mut raw = Vec::with_capacity(pipeline.generated_token_ids.len() * 4);
+            for id in &pipeline.generated_token_ids {
+                raw.extend_from_slice(&id.to_le_bytes());
+            }
+            hex::encode(raw)
+        };
+
+        let fields = b3lite::ReceiptFields {
+            request_id,
+            miner_wallet,
+            model_id: &pipeline.manifest.model_id,
+            gguf_sha256,
+            response_hash,
+            generated_token_ids: &pipeline.generated_token_ids,
+        };
+        let signature = b3lite::sign_receipt(&cfg.secret, &fields);
+        let sampled = b3lite::should_sample(&signature, cfg.sample_rate);
+
+        match db::repo::create_b3lite_receipt(
+            &self.db,
+            request_id,
+            miner_wallet,
+            &pipeline.manifest.model_id,
+            gguf_sha256,
+            Some(&pipeline.prompt_hash),
+            &pipeline.original_prompt_hex,
+            response_hash,
+            &generated_token_ids_hex,
+            pipeline.manifest.num_layers as i32,
+            &signature,
+            sampled,
+        )
+        .await
+        {
+            Ok(id) => {
+                tracing::info!(receipt_id = id, request_id = %request_id, sampled, "B3-lite receipt recorded");
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, request_id = %request_id, "failed to persist B3-lite receipt (non-fatal — commit/reveal/publish proceeds regardless)");
             }
         }
     }

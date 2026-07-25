@@ -34,6 +34,15 @@ sqlx        = { version = "0.7", features = ["runtime-tokio-rustls", "postgres",
 # crypto / encoding
 sha2        = "0.10"
 hex         = "0.4"
+# B3-lite (see opoi/b3lite.rs): HMAC-SHA256 signed receipts — a symmetric,
+# operator-shared-secret signature. Deliberately not an asymmetric scheme:
+# this receipt is an OFF-CHAIN-ONLY accountability artifact for the
+# bridge operator's own sampling/audit/consequence pipeline (see the
+# B3-lite scope doc — "no consensus change"), not a publicly-verifiable
+# on-chain commitment, so there's no third party needing to verify it
+# without sharing the secret, and no existing asymmetric-signing key
+# management infrastructure in this codebase to build on instead.
+hmac        = "0.12"
 
 # F15-L (speculative_engine.rs): the bridge needs to know the prompt's REAL
 # token count (to seed `base`, the KV-cache position speculative rounds are

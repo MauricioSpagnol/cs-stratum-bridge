@@ -1,4 +1,6 @@
 pub mod assignment;
+pub mod b3lite;
+pub mod b3lite_audit;
 pub mod engine;
 pub mod handler;
 pub mod shard_engine;
