@@ -14,7 +14,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use opoi::b3lite_audit::B3LiteAuditor;
-use opoi::handler::{OpoiHandler, ShardHandler, SpeculativeHandler};
+use opoi::handler::{AuditHandler, OpoiHandler, ShardHandler, SpeculativeHandler};
 use opoi::shard_engine::ModelSourceConfig;
 use opoi::speculative_engine::DraftModelConfig;
 use opoi::{OpoiEngine, ShardEngine, SpeculativeEngine};
@@ -87,6 +87,21 @@ async fn main() -> anyhow::Result<()> {
     // pipelines are simply lost on restart and re-picked-up fresh from
     // PENDING on the next poll tick (see shard_engine.rs's module doc).
 
+    // B3-lite: rebuild MinerRegistry's in-memory ban set from the durable
+    // consequence table — otherwise a restart would silently un-eject every
+    // wallet ejected before it (see MinerRegistry::ban's doc comment).
+    match db::repo::list_ejected_wallets(&db_pool).await {
+        Ok(wallets) => {
+            for wallet in &wallets {
+                registry.ban(wallet);
+            }
+            if !wallets.is_empty() {
+                tracing::info!(count = wallets.len(), "B3-lite: restored ejected-wallet bans from durable consequence history");
+            }
+        }
+        Err(e) => tracing::warn!(error = %e, "B3-lite: failed to restore ejected-wallet bans at startup"),
+    }
+
     spawn_interval(cfg.poll_interval_ms, {
         let engine = engine.clone();
         move || {
@@ -126,19 +141,23 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
-    // B3-lite (see opoi/b3lite_audit.rs): only actually runs anything once
-    // both a receipt secret is configured AND at least one sampled receipt
-    // exists to audit — a disabled config just means `audit_tick` finds
-    // nothing pending every time (no receipts are ever recorded without
-    // `b3lite_cfg`, see ShardEngine::record_b3lite_receipt).
+    // B3-lite (see opoi/b3lite_audit.rs): constructed unconditionally, same
+    // reasoning as `speculative_engine` above — when B3-lite is disabled
+    // (no B3LITE_RECEIPT_SECRET), no receipt ever gets `sampled = true`
+    // (see ShardEngine::record_b3lite_receipt's guard), so `audit_tick`
+    // simply finds nothing pending every tick. Also doubles as this
+    // process's `Arc<dyn AuditHandler>` for the proxy's stratum-audit-
+    // dispatch reply path below, regardless of whether the periodic tick
+    // itself is spawned.
+    let b3lite_auditor = Arc::new(B3LiteAuditor::new(
+        db_pool.clone(),
+        ModelSourceConfig::from_env(),
+        registry.clone(),
+        cfg.auditor_cs_miner_bin.clone(),
+        std::path::PathBuf::from(&cfg.auditor_cache_dir),
+        cfg.auditor_trusted_wallet_list(),
+    ));
     if b3lite_cfg.is_some() {
-        let b3lite_auditor = Arc::new(B3LiteAuditor::new(
-            db_pool.clone(),
-            ModelSourceConfig::from_env(),
-            registry.clone(),
-            cfg.auditor_cs_miner_bin.clone(),
-            std::path::PathBuf::from(&cfg.auditor_cache_dir),
-        ));
         spawn_interval(cfg.b3lite_audit_poll_interval_ms, {
             let b3lite_auditor = b3lite_auditor.clone();
             move || {
@@ -208,6 +227,7 @@ async fn main() -> anyhow::Result<()> {
     let handler: Arc<dyn OpoiHandler> = engine.clone();
     let shard_handler: Arc<dyn ShardHandler> = shard_engine.clone();
     let speculative_handler: Arc<dyn SpeculativeHandler> = speculative_engine.clone();
+    let audit_handler: Arc<dyn AuditHandler> = b3lite_auditor.clone();
     let proxy_task = tokio::spawn(proxy::listener::run(
         cfg.listen_addr.clone(),
         cfg.upstream_pool_addr.clone(),
@@ -215,6 +235,7 @@ async fn main() -> anyhow::Result<()> {
         handler,
         shard_handler,
         speculative_handler,
+        audit_handler,
     ));
 
     tokio::select! {

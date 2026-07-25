@@ -3,20 +3,25 @@
 //! and "ESCOPO CONCRETO DA B3-LITE" in `CS COIN OPoI MELHOR IMPLEMENTAÇÃO.txt`
 //! for the full design history.
 //!
-//! Dispatch design: this bridge runs the audit by invoking a LOCAL
-//! `cs-miner` binary as a subprocess (`cs-miner --audit-request <file>`,
-//! see that crate's `src/opoi/auditor.rs`/`cli.rs`), not by pushing an
-//! audit assignment to some arbitrary CONNECTED miner over the stratum
-//! wire protocol. This is a deliberate choice, not a shortcut: B3-lite's
-//! off-chain consequence (withhold pay / reputation flag / eject) is
-//! imposed unilaterally by THIS bridge operator, so the audit needs to be
-//! something the OPERATOR trusts independently — asking a random pool
-//! participant to audit a peer gives no extra security margin (that peer
-//! has exactly as much self-interest as the one being audited, with no
-//! stake/slashing backing its own honesty here — that's B3-full's
-//! still-unbuilt on-chain fraud-oracle territory, not this). A trusted
-//! local subprocess is both simpler AND the more correct trust model for
-//! an off-chain-only mechanism.
+//! Dispatch design: an audit only ever runs somewhere THIS bridge operator
+//! trusts — never an arbitrary connected miner. Two paths, tried in order:
+//!
+//! 1. **Stratum, to an operator-designated wallet** (`opoi.audit_assign`/
+//!    `opoi.audit_result`, see `pow::stratum.rs` on cs-miner's side): only
+//!    ever dispatched to a wallet BOTH currently connected AND announced
+//!    the `auditor` capability AND present in this operator's own
+//!    `Config::auditor_trusted_wallets` allow-list (see
+//!    `MinerRegistry::pick_auditor_capable`) — lets the operator run a
+//!    dedicated auditor machine (or several) as a normal pool connection
+//!    instead of needing local compute on the bridge host itself.
+//! 2. **Local subprocess fallback** (`cs-miner --audit-request <file>`):
+//!    always available, no dependency on any miner being connected.
+//!
+//! Deliberately NOT a third option — dispatching to an arbitrary connected
+//! miner (not specifically designated trusted) — because that miner has
+//! exactly as much self-interest as the one being audited, with no
+//! stake/slashing backing its own honesty here (that's B3-full's
+//! still-unbuilt on-chain fraud-oracle territory, not this).
 //!
 //! Consequence policy (see `apply_consequence`): every confirmed DIVERGENT
 //! audit withholds pay for that one request and flags the wallet's
@@ -30,40 +35,41 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
+use dashmap::DashMap;
 use sqlx::PgPool;
+use tokio::sync::oneshot;
 
 use crate::db;
 use crate::db::models::B3LiteReceipt;
+use crate::error::AppError;
 use crate::miner_registry::MinerRegistry;
-use crate::opoi::shard_engine::ModelSourceConfig;
+use crate::opoi::shard_engine::{ModelSource, ModelSourceConfig};
+use crate::opoi::wire::{self, AuditPositionWire, OpoiAuditResult};
 
-/// Matches cs-miner's `opoi::auditor::AuditVerdict`/`PositionVerdict` JSON
-/// shape (see that crate's `auditor.rs` — both derive `serde::Serialize`
-/// with no rename attributes, so field names line up as-is). Duplicated
-/// here rather than shared via a crate dependency: these are two separate
-/// binaries/repos, and the wire format is JSON on stdout, not a Rust type.
-#[derive(Debug, serde::Deserialize, serde::Serialize)]
-struct AuditVerdictJson {
-    positions: Vec<AuditPositionJson>,
+/// Subprocess-stdout counterpart of `wire::OpoiAuditResult` — same
+/// `positions` shape, but cs-miner's `--audit-request` CLI prints only
+/// `{"positions":[...]}` (no `request_id` wrapper) to stdout, unlike the
+/// stratum wire message.
+#[derive(Debug, serde::Deserialize)]
+struct AuditStdoutJson {
+    positions: Vec<AuditPositionWire>,
 }
 
-#[derive(Debug, serde::Deserialize, serde::Serialize)]
-struct AuditPositionJson {
-    #[allow(dead_code)]
-    step: usize,
-    #[allow(dead_code)]
-    committed_token_id: u32,
-    #[allow(dead_code)]
-    auditor_token_id: u32,
-    admissible: bool,
+fn all_admissible(positions: &[AuditPositionWire]) -> bool {
+    !positions.is_empty() && positions.iter().all(|p| p.admissible)
 }
 
-impl AuditVerdictJson {
-    fn all_admissible(&self) -> bool {
-        !self.positions.is_empty() && self.positions.iter().all(|p| p.admissible)
-    }
-}
+/// How long to wait for a dispatched-to-stratum auditor to answer before
+/// falling back to the local subprocess — generous: a real forward pass
+/// over a multi-GB GGUF (possibly after downloading it fresh) can
+/// legitimately take a couple of minutes on modest hardware.
+const STRATUM_AUDIT_TIMEOUT: Duration = Duration::from_secs(180);
+
+/// A wallet accumulating this many confirmed-divergent audits, ever, is
+/// additionally ejected from future OPoI dispatch — see module doc.
+const EJECT_AFTER_DIVERGENCES: i64 = 3;
 
 pub struct B3LiteAuditor {
     db: PgPool,
@@ -71,23 +77,37 @@ pub struct B3LiteAuditor {
     registry: Arc<MinerRegistry>,
     cs_miner_bin: String,
     cache_dir: PathBuf,
+    trusted_wallets: Vec<String>,
+    /// Outstanding stratum audit dispatches: `request_id` -> the wallet
+    /// expected to answer (assignment-verification, same contract
+    /// `ShardEngine::assignments` gives shard dispatch) — checked by
+    /// `handle_audit_result` before accepting a reply.
+    audit_assignments: DashMap<String, String>,
+    /// Outstanding stratum audit dispatches: `request_id` -> a one-shot
+    /// sender `dispatch_via_stratum` is awaiting on. Removed (and the
+    /// oneshot fires) the moment a matching `opoi.audit_result` arrives.
+    pending: DashMap<String, oneshot::Sender<Vec<AuditPositionWire>>>,
 }
 
-/// A wallet accumulating this many confirmed-divergent audits, ever, is
-/// additionally ejected from future OPoI dispatch — see module doc.
-const EJECT_AFTER_DIVERGENCES: i64 = 3;
-
 impl B3LiteAuditor {
-    pub fn new(db: PgPool, model_sources: ModelSourceConfig, registry: Arc<MinerRegistry>, cs_miner_bin: String, cache_dir: PathBuf) -> Self {
-        Self { db, model_sources, registry, cs_miner_bin, cache_dir }
+    pub fn new(
+        db: PgPool,
+        model_sources: ModelSourceConfig,
+        registry: Arc<MinerRegistry>,
+        cs_miner_bin: String,
+        cache_dir: PathBuf,
+        trusted_wallets: Vec<String>,
+    ) -> Self {
+        Self { db, model_sources, registry, cs_miner_bin, cache_dir, trusted_wallets, audit_assignments: DashMap::new(), pending: DashMap::new() }
     }
 
     /// One tick: replay every receipt sampled for audit that hasn't been
-    /// audited yet. Sequential (not concurrent) deliberately — each replay
-    /// spawns a whole model-loading subprocess, and running several at
-    /// once would multiply peak RAM/CPU usage on whatever host runs this
-    /// bridge; B3-lite's sample rate is meant to be small precisely so a
-    /// sequential tick keeps up.
+    /// audited yet. Sequential (not concurrent) deliberately — even the
+    /// stratum path ties up ONE trusted auditor connection at a time, and
+    /// the subprocess fallback spawns a whole model-loading process;
+    /// running several at once would multiply peak RAM/CPU usage on
+    /// whatever host(s) run this. B3-lite's sample rate is meant to be
+    /// small precisely so a sequential tick keeps up.
     pub async fn audit_tick(&self) {
         let pending = match db::repo::list_pending_b3lite_audits(&self.db).await {
             Ok(rows) => rows,
@@ -110,7 +130,6 @@ impl B3LiteAuditor {
             self.mark_inconclusive(receipt.id, "no ModelSource entry for this model_id").await;
             return;
         };
-
         let Some(prompt_text) = decode_prompt_hex(&receipt.prompt_hex) else {
             tracing::warn!(request_id = %request_id, "b3lite audit: stored prompt_hex is not valid UTF-8 hex — marking INCONCLUSIVE");
             self.mark_inconclusive(receipt.id, "prompt_hex did not decode to valid UTF-8").await;
@@ -122,10 +141,107 @@ impl B3LiteAuditor {
             return;
         };
 
+        let verdict_result = match self.registry.pick_auditor_capable(&self.trusted_wallets, &receipt.miner_wallet) {
+            Some(wallet) => {
+                tracing::info!(request_id = %request_id, wallet = %wallet, "b3lite audit: dispatching via stratum to a trusted auditor");
+                match self.dispatch_via_stratum(&wallet, &receipt, &source, &prompt_text, &committed_token_ids).await {
+                    Ok(positions) => Ok(positions),
+                    Err(e) => {
+                        tracing::warn!(request_id = %request_id, wallet = %wallet, error = %e, "b3lite audit: stratum dispatch failed, falling back to local subprocess");
+                        self.dispatch_via_subprocess(&receipt, &source, &prompt_text, &committed_token_ids).await
+                    }
+                }
+            }
+            None => self.dispatch_via_subprocess(&receipt, &source, &prompt_text, &committed_token_ids).await,
+        };
+
+        let positions = match verdict_result {
+            Ok(p) => p,
+            Err(e) => {
+                self.mark_inconclusive(receipt.id, &e).await;
+                return;
+            }
+        };
+
+        let admissible = all_admissible(&positions);
+        let status = if admissible { "ADMISSIBLE" } else { "DIVERGENT" };
+        let detail = serde_json::to_string(&positions).unwrap_or_default();
+
+        if let Err(e) = db::repo::mark_b3lite_audit_result(&self.db, receipt.id, status, &detail).await {
+            tracing::warn!(error = %e, request_id = %request_id, "b3lite audit: failed to persist audit result");
+        }
+
+        if admissible {
+            tracing::info!(request_id = %request_id, receipt_id = receipt.id, "B3-lite audit: ADMISSIBLE");
+        } else {
+            tracing::warn!(request_id = %request_id, receipt_id = receipt.id, wallet = %receipt.miner_wallet, "B3-lite audit: DIVERGENT — applying off-chain consequence");
+            self.apply_consequence(&receipt).await;
+        }
+    }
+
+    /// Dispatches to `wallet` over stratum and awaits its `opoi.audit_result`
+    /// (or a timeout). `Err` covers every reason this path didn't produce a
+    /// verdict — the caller falls back to the local subprocess on any of
+    /// them, so the exact wording is diagnostic only.
+    async fn dispatch_via_stratum(
+        &self,
+        wallet: &str,
+        receipt: &B3LiteReceipt,
+        source: &ModelSource,
+        prompt_text: &str,
+        committed_token_ids: &[u32],
+    ) -> Result<Vec<AuditPositionWire>, String> {
+        let tx = self.registry.get(wallet).ok_or_else(|| format!("wallet {wallet} not connected"))?;
+
+        let assign = wire::OpoiAuditAssign {
+            request_id: receipt.request_id.clone(),
+            model_id: receipt.model_id.clone(),
+            gguf_url: source.gguf_url.clone(),
+            gguf_sha256: receipt.gguf_sha256.clone(),
+            tokenizer_url: source.tokenizer_url.clone(),
+            tokenizer_sha256: source.tokenizer_sha256.clone(),
+            prompt_hex: hex::encode(prompt_text.as_bytes()),
+            committed_token_ids: committed_token_ids.to_vec(),
+            total_layers: receipt.total_layers as u32,
+        };
+
+        let (result_tx, result_rx) = oneshot::channel();
+        self.audit_assignments.insert(receipt.request_id.clone(), wallet.to_string());
+        self.pending.insert(receipt.request_id.clone(), result_tx);
+
+        if tx.send(wire::build_audit_assign_line(&assign)).is_err() {
+            self.audit_assignments.remove(&receipt.request_id);
+            self.pending.remove(&receipt.request_id);
+            return Err(format!("wallet {wallet}'s downstream channel is closed"));
+        }
+
+        let outcome = tokio::time::timeout(STRATUM_AUDIT_TIMEOUT, result_rx).await;
+
+        // Always clean up both maps regardless of outcome — a late-arriving
+        // `opoi.audit_result` after a timeout must not be silently accepted
+        // for whatever NEXT dispatch happens to reuse this request_id (it
+        // won't in practice, request_ids are unique per on-chain request,
+        // but this is the same "never trust a stale entry" discipline
+        // `ShardEngine::assignments` already follows).
+        self.audit_assignments.remove(&receipt.request_id);
+        self.pending.remove(&receipt.request_id);
+
+        match outcome {
+            Ok(Ok(positions)) => Ok(positions),
+            Ok(Err(_)) => Err(format!("audit oneshot dropped for wallet {wallet}")),
+            Err(_) => Err(format!("audit via wallet {wallet} timed out after {STRATUM_AUDIT_TIMEOUT:?}")),
+        }
+    }
+
+    async fn dispatch_via_subprocess(
+        &self,
+        receipt: &B3LiteReceipt,
+        source: &ModelSource,
+        prompt_text: &str,
+        committed_token_ids: &[u32],
+    ) -> Result<Vec<AuditPositionWire>, String> {
         if let Err(e) = tokio::fs::create_dir_all(&self.cache_dir).await {
-            tracing::warn!(error = %e, request_id = %request_id, "b3lite audit: could not create cache_dir — marking INCONCLUSIVE");
-            self.mark_inconclusive(receipt.id, &format!("could not create cache_dir: {e}")).await;
-            return;
+            return Err(format!("could not create cache_dir: {e}"));
         }
 
         let request_json = serde_json::json!({
@@ -146,9 +262,7 @@ impl B3LiteAuditor {
             Err(e) => Err(std::io::Error::other(e)),
         };
         if let Err(e) = write_result {
-            tracing::warn!(error = %e, request_id = %request_id, "b3lite audit: could not write request file — marking INCONCLUSIVE");
-            self.mark_inconclusive(receipt.id, &format!("could not write request file: {e}")).await;
-            return;
+            return Err(format!("could not write request file: {e}"));
         }
 
         let output = tokio::process::Command::new(&self.cs_miner_bin)
@@ -161,45 +275,16 @@ impl B3LiteAuditor {
 
         let _ = tokio::fs::remove_file(&tmp_path).await;
 
-        let out = match output {
-            Ok(out) => out,
-            Err(e) => {
-                tracing::warn!(error = %e, request_id = %request_id, bin = %self.cs_miner_bin, "b3lite audit: could not spawn auditor subprocess — marking INCONCLUSIVE");
-                self.mark_inconclusive(receipt.id, &format!("could not spawn auditor subprocess: {e}")).await;
-                return;
-            }
-        };
+        let out = output.map_err(|e| format!("could not spawn auditor subprocess ({}): {e}", self.cs_miner_bin))?;
 
         if !out.status.success() {
             let stderr = String::from_utf8_lossy(&out.stderr);
-            tracing::warn!(request_id = %request_id, status = ?out.status, stderr = %stderr, "b3lite audit: auditor subprocess exited non-zero — marking INCONCLUSIVE");
-            self.mark_inconclusive(receipt.id, &format!("auditor subprocess exited {:?}: {stderr}", out.status)).await;
-            return;
+            return Err(format!("auditor subprocess exited {:?}: {stderr}", out.status));
         }
 
-        let verdict: AuditVerdictJson = match serde_json::from_slice(&out.stdout) {
-            Ok(v) => v,
-            Err(e) => {
-                tracing::warn!(error = %e, request_id = %request_id, "b3lite audit: could not parse auditor stdout — marking INCONCLUSIVE");
-                self.mark_inconclusive(receipt.id, &format!("could not parse auditor stdout: {e}")).await;
-                return;
-            }
-        };
-
-        let all_admissible = verdict.all_admissible();
-        let status = if all_admissible { "ADMISSIBLE" } else { "DIVERGENT" };
-        let detail = serde_json::to_string(&verdict).unwrap_or_default();
-
-        if let Err(e) = db::repo::mark_b3lite_audit_result(&self.db, receipt.id, status, &detail).await {
-            tracing::warn!(error = %e, request_id = %request_id, "b3lite audit: failed to persist audit result");
-        }
-
-        if all_admissible {
-            tracing::info!(request_id = %request_id, receipt_id = receipt.id, "B3-lite audit: ADMISSIBLE");
-        } else {
-            tracing::warn!(request_id = %request_id, receipt_id = receipt.id, wallet = %receipt.miner_wallet, "B3-lite audit: DIVERGENT — applying off-chain consequence");
-            self.apply_consequence(&receipt).await;
-        }
+        let parsed: AuditStdoutJson =
+            serde_json::from_slice(&out.stdout).map_err(|e| format!("could not parse auditor stdout: {e}"))?;
+        Ok(parsed.positions)
     }
 
     async fn mark_inconclusive(&self, receipt_id: i64, detail: &str) {
@@ -237,6 +322,41 @@ impl B3LiteAuditor {
     }
 }
 
+#[async_trait::async_trait]
+impl crate::opoi::handler::AuditHandler for B3LiteAuditor {
+    async fn handle_audit_result(&self, wallet: &str, result: OpoiAuditResult) -> Result<(), AppError> {
+        {
+            let Some(assignment) = self.audit_assignments.get(&result.request_id) else {
+                return Err(AppError::UnknownRequest);
+            };
+            if assignment.value() != wallet {
+                return Err(AppError::NotAssignedToCaller);
+            }
+        }
+
+        let Some((_, sender)) = self.pending.remove(&result.request_id) else {
+            // Already timed out (dispatch_via_stratum's own cleanup already
+            // removed both entries) — a late reply, not an error to the
+            // caller, but nothing to deliver it to either.
+            return Ok(());
+        };
+        let _ = sender.send(result.positions);
+        Ok(())
+    }
+
+    async fn on_disconnect(&self, wallet: &str) {
+        // Drop (fail fast, not "wait for timeout") any outstanding
+        // dispatch whose expected wallet just disconnected — the oneshot's
+        // Sender dropping resolves dispatch_via_stratum's `.await` as
+        // Err immediately instead of idling until STRATUM_AUDIT_TIMEOUT.
+        let stale: Vec<String> = self.audit_assignments.iter().filter(|e| e.value() == wallet).map(|e| e.key().clone()).collect();
+        for request_id in stale {
+            self.audit_assignments.remove(&request_id);
+            self.pending.remove(&request_id); // dropping the Sender is enough to unblock the waiter
+        }
+    }
+}
+
 /// Reverses the hex-encoding `http/handlers.rs::submit_prompt` applies at
 /// intake (`hex::encode(body.prompt.as_bytes())`) — the same round trip
 /// every miner's own `ShardInputWire::Prompt` handling already performs.
@@ -257,15 +377,8 @@ fn decode_token_ids_hex(hex_str: &str) -> Option<Vec<u32>> {
 
 #[cfg(test)]
 mod live_audit_tick_test {
-    //! End-to-end smoke test for `audit_tick` itself — the one piece none
-    //! of the other tests (pure-function unit tests here, the live-DB repo
-    //! test in `db/repo.rs`, cs-miner's own CLI acceptance test) actually
-    //! exercises together: a real receipt row, a real `ModelSourceConfig`,
-    //! a real `cs-miner --audit-request` subprocess invocation, and real
-    //! JSON parsed back out of its stdout. Gated on ALL of
-    //! `B3LITE_TEST_DATABASE_URL` / `B3LITE_TEST_CS_MINER_BIN` /
-    //! `B3LITE_TEST_MODEL_SOURCES_JSON` being set — skips otherwise, same
-    //! reasoning as `db/repo.rs`'s live-DB test.
+    //! End-to-end smoke test for `audit_tick` itself (subprocess path) —
+    //! see `db/repo.rs`'s live-DB test for the same gating reasoning.
     use super::*;
     use crate::miner_registry::MinerRegistry;
 
@@ -311,7 +424,10 @@ mod live_audit_tick_test {
 
         let cache_dir = std::env::temp_dir().join(format!("b3lite_audit_test_{receipt_id}"));
         let registry = std::sync::Arc::new(MinerRegistry::new());
-        let auditor = B3LiteAuditor::new(pool.clone(), model_sources, registry, cs_miner_bin, cache_dir.clone());
+        // No trusted wallets configured — this test exercises the
+        // subprocess fallback path only (dedicated stratum-path tests live
+        // separately, see `stratum_dispatch_tests` below).
+        let auditor = B3LiteAuditor::new(pool.clone(), model_sources, registry, cs_miner_bin, cache_dir.clone(), vec![]);
 
         auditor.audit_tick().await;
 
@@ -363,31 +479,134 @@ mod tests {
         assert_eq!(decode_token_ids_hex(""), Some(vec![]));
     }
 
-    #[test]
-    fn audit_verdict_all_admissible_true_when_every_position_is() {
-        let v = AuditVerdictJson {
-            positions: vec![
-                AuditPositionJson { step: 0, committed_token_id: 1, auditor_token_id: 1, admissible: true },
-                AuditPositionJson { step: 1, committed_token_id: 2, auditor_token_id: 2, admissible: true },
-            ],
-        };
-        assert!(v.all_admissible());
+    fn position(admissible: bool) -> AuditPositionWire {
+        AuditPositionWire { step: 0, committed_token_id: 1, auditor_token_id: 1, admissible }
     }
 
     #[test]
-    fn audit_verdict_all_admissible_false_on_any_divergent_position() {
-        let v = AuditVerdictJson {
-            positions: vec![
-                AuditPositionJson { step: 0, committed_token_id: 1, auditor_token_id: 1, admissible: true },
-                AuditPositionJson { step: 1, committed_token_id: 99, auditor_token_id: 2, admissible: false },
-            ],
-        };
-        assert!(!v.all_admissible());
+    fn all_admissible_true_when_every_position_is() {
+        assert!(all_admissible(&[position(true), position(true)]));
     }
 
     #[test]
-    fn audit_verdict_all_admissible_false_when_empty() {
-        let v = AuditVerdictJson { positions: vec![] };
-        assert!(!v.all_admissible());
+    fn all_admissible_false_on_any_divergent_position() {
+        assert!(!all_admissible(&[position(true), position(false)]));
+    }
+
+    #[test]
+    fn all_admissible_false_when_empty() {
+        assert!(!all_admissible(&[]));
+    }
+}
+
+#[cfg(test)]
+mod stratum_dispatch_tests {
+    //! Unit tests for `dispatch_via_stratum`/`handle_audit_result`'s
+    //! correlation logic — no live DB/subprocess needed, since these never
+    //! reach `run_one`'s DB-writing tail. Uses a fake downstream channel
+    //! (an `UnboundedReceiver` this test reads from directly) instead of a
+    //! real stratum socket, same boundary `MinerRegistry` already draws
+    //! (it only ever sees a channel, never a socket).
+    use super::*;
+    use crate::opoi::handler::AuditHandler;
+    use crate::opoi::wire::{AuditPositionWire, OpoiAuditResult};
+
+    fn auditor_with_registry() -> (B3LiteAuditor, Arc<MinerRegistry>) {
+        let registry = Arc::new(MinerRegistry::new());
+        // A real PgPool is never touched by these tests (they never reach
+        // `run_one`'s DB-writing tail) — `connect_lazy` builds a pool
+        // object without dialing anything.
+        let db = PgPool::connect_lazy("postgres://unused/unused").expect("lazy pool");
+        let auditor = B3LiteAuditor::new(db, ModelSourceConfig::from_env(), registry.clone(), "unused".into(), PathBuf::from("/tmp"), vec!["trusted-wallet".into()]);
+        (auditor, registry)
+    }
+
+    #[tokio::test]
+    async fn dispatch_via_stratum_delivers_verdict_on_matching_reply() {
+        let (auditor, registry) = auditor_with_registry();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        registry.register("trusted-wallet".to_string(), tx);
+        registry.mark_auditor_capable("trusted-wallet");
+
+        let source = ModelSource { gguf_url: "http://x/gguf".into(), tokenizer_url: "http://x/tok".into(), tokenizer_sha256: "tok-hash".into() };
+        let receipt = B3LiteReceipt {
+            id: 1, request_id: "req-1".into(), miner_wallet: "audited-wallet".into(), model_id: "M".into(),
+            gguf_sha256: "gguf-hash".into(), prompt_hash: None, prompt_hex: hex::encode("hi"), response_hash: "r".into(),
+            generated_token_ids_hex: String::new(), total_layers: 4, signature_hex: "sig".into(), sampled: true,
+            audit_status: "PENDING".into(), audit_detail: None, created_at: chrono::Utc::now(), audited_at: None,
+        };
+
+        let dispatch = tokio::spawn(async move { auditor.dispatch_via_stratum("trusted-wallet", &receipt, &source, "hi", &[1, 2]).await });
+
+        // Drain the pushed opoi.audit_assign line (proves it was actually sent).
+        let line = rx.recv().await.expect("assign line sent");
+        assert!(line.contains("opoi.audit_assign"));
+        assert!(line.contains("\"request_id\":\"req-1\""));
+
+        // Note: can't call auditor.handle_audit_result here — auditor was
+        // moved into the spawned task. This test only proves the assign
+        // line is sent correctly; the correlation itself is proven by
+        // `handle_audit_result_delivers_to_the_matching_pending_dispatch`
+        // below using the same auditor instance directly (no spawn).
+        dispatch.abort();
+    }
+
+    #[tokio::test]
+    async fn handle_audit_result_rejects_wrong_wallet() {
+        let (auditor, registry) = auditor_with_registry();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        registry.register("trusted-wallet".to_string(), tx);
+        auditor.audit_assignments.insert("req-1".to_string(), "trusted-wallet".to_string());
+        auditor.pending.insert("req-1".to_string(), oneshot::channel().0);
+
+        let result = OpoiAuditResult { request_id: "req-1".into(), positions: vec![] };
+        let outcome = auditor.handle_audit_result("some-other-wallet", result).await;
+        assert!(matches!(outcome, Err(AppError::NotAssignedToCaller)));
+    }
+
+    #[tokio::test]
+    async fn handle_audit_result_rejects_unknown_request() {
+        let (auditor, _registry) = auditor_with_registry();
+        let result = OpoiAuditResult { request_id: "never-dispatched".into(), positions: vec![] };
+        let outcome = auditor.handle_audit_result("any-wallet", result).await;
+        assert!(matches!(outcome, Err(AppError::UnknownRequest)));
+    }
+
+    #[tokio::test]
+    async fn handle_audit_result_delivers_to_the_matching_pending_dispatch() {
+        let (auditor, registry) = auditor_with_registry();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        registry.register("trusted-wallet".to_string(), tx);
+
+        let (result_tx, result_rx) = oneshot::channel();
+        auditor.audit_assignments.insert("req-1".to_string(), "trusted-wallet".to_string());
+        auditor.pending.insert("req-1".to_string(), result_tx);
+
+        let positions = vec![AuditPositionWire { step: 0, committed_token_id: 1, auditor_token_id: 1, admissible: true }];
+        let result = OpoiAuditResult { request_id: "req-1".into(), positions: positions.clone() };
+        auditor.handle_audit_result("trusted-wallet", result).await.expect("should be accepted");
+
+        let delivered = result_rx.await.expect("oneshot should have fired");
+        assert_eq!(delivered.len(), positions.len());
+        assert_eq!(delivered[0].admissible, positions[0].admissible);
+    }
+
+    #[tokio::test]
+    async fn on_disconnect_unblocks_a_waiting_dispatch_immediately() {
+        let (auditor, registry) = auditor_with_registry();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        registry.register("trusted-wallet".to_string(), tx);
+
+        let (result_tx, result_rx) = oneshot::channel::<Vec<AuditPositionWire>>();
+        auditor.audit_assignments.insert("req-1".to_string(), "trusted-wallet".to_string());
+        auditor.pending.insert("req-1".to_string(), result_tx);
+
+        auditor.on_disconnect("trusted-wallet").await;
+
+        // The Sender was dropped (removed from `pending`, not fulfilled),
+        // so awaiting the Receiver resolves to an error immediately
+        // instead of hanging until STRATUM_AUDIT_TIMEOUT.
+        assert!(result_rx.await.is_err());
+        assert!(!auditor.audit_assignments.contains_key("req-1"));
     }
 }

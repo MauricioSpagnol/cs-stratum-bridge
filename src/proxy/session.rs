@@ -16,10 +16,11 @@ use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 
 use crate::error::AppError;
 use crate::miner_registry::MinerRegistry;
-use crate::opoi::handler::{OpoiHandler, ShardHandler, SpeculativeHandler};
+use crate::opoi::handler::{AuditHandler, OpoiHandler, ShardHandler, SpeculativeHandler};
 use crate::opoi::wire::{
-    build_shard_result_ack, build_shard_result_error, build_submit_result_ack, build_submit_result_error,
-    OpoiDraftResult, OpoiKvRollbackAck, OpoiShardResult, OpoiSubmitResultParams,
+    build_audit_result_ack, build_audit_result_error, build_shard_result_ack, build_shard_result_error,
+    build_submit_result_ack, build_submit_result_error, OpoiAuditResult, OpoiDraftResult, OpoiKvRollbackAck, OpoiShardResult,
+    OpoiSubmitResultParams,
 };
 
 /// Shared, mutable "who is this connection" state, handed off between the
@@ -44,6 +45,7 @@ pub async fn run_session(
     handler: Arc<dyn OpoiHandler>,
     shard_handler: Arc<dyn ShardHandler>,
     speculative_handler: Arc<dyn SpeculativeHandler>,
+    audit_handler: Arc<dyn AuditHandler>,
 ) -> anyhow::Result<()> {
     let peer = downstream.peer_addr().ok();
 
@@ -78,7 +80,7 @@ pub async fn run_session(
     let auth = AuthState::default();
 
     tokio::select! {
-        _ = down_reader_loop(&mut down_lines, down_tx.clone(), up_tx.clone(), registry.clone(), handler.clone(), shard_handler.clone(), speculative_handler.clone(), auth.clone()) => {
+        _ = down_reader_loop(&mut down_lines, down_tx.clone(), up_tx.clone(), registry.clone(), handler.clone(), shard_handler.clone(), speculative_handler.clone(), audit_handler.clone(), auth.clone()) => {
             tracing::debug!(peer = ?peer, "downstream reader ended session");
         }
         _ = up_reader_loop(&mut up_lines, down_tx.clone(), registry.clone(), auth.clone()) => {
@@ -100,6 +102,7 @@ pub async fn run_session(
         handler.on_disconnect(&wallet).await;
         shard_handler.on_disconnect(&wallet).await;
         speculative_handler.on_disconnect(&wallet).await;
+        audit_handler.on_disconnect(&wallet).await;
         tracing::info!(peer = ?peer, wallet = %wallet, "session ended; unregistered miner and released its pending assignments");
     }
 
@@ -138,6 +141,7 @@ async fn down_reader_loop(
     handler: Arc<dyn OpoiHandler>,
     shard_handler: Arc<dyn ShardHandler>,
     speculative_handler: Arc<dyn SpeculativeHandler>,
+    audit_handler: Arc<dyn AuditHandler>,
     auth: AuthState,
 ) {
     loop {
@@ -221,6 +225,32 @@ async fn down_reader_loop(
                     }
                 }
             }
+            Some("opoi.audit_result") => {
+                let id = value.as_ref().and_then(|v| v.get("id")).cloned().unwrap_or(Value::Null);
+                let params_val = value.as_ref().and_then(|v| v.get("params")).and_then(|p| p.get(0)).cloned();
+
+                let parsed: Option<OpoiAuditResult> = params_val.and_then(|p| serde_json::from_value(p).ok());
+
+                let Some(result) = parsed else {
+                    let _ = down_tx.send(build_audit_result_error(id, serde_json::json!([20, "malformed opoi.audit_result", null])));
+                    continue;
+                };
+
+                let wallet = auth.confirmed.lock().clone();
+                let Some(wallet) = wallet else {
+                    let _ = down_tx.send(build_audit_result_error(id, AppError::Unauthorized.to_stratum_error()));
+                    continue;
+                };
+
+                match audit_handler.handle_audit_result(&wallet, result).await {
+                    Ok(()) => {
+                        let _ = down_tx.send(build_audit_result_ack(id));
+                    }
+                    Err(app_err) => {
+                        let _ = down_tx.send(build_audit_result_error(id, app_err.to_stratum_error()));
+                    }
+                }
+            }
             Some("opoi.draft_result") => {
                 // No reply sent back down for this one — see
                 // `SpeculativeHandler`'s doc comment for why.
@@ -261,6 +291,10 @@ async fn down_reader_loop(
                     if caps.iter().any(|c| c == "draft") {
                         registry.mark_draft_capable(&wallet);
                         tracing::info!(wallet = %wallet, "miner registered `draft` capability (F17-D)");
+                    }
+                    if caps.iter().any(|c| c == "auditor") {
+                        registry.mark_auditor_capable(&wallet);
+                        tracing::info!(wallet = %wallet, "miner registered `auditor` capability (B3-lite)");
                     }
                 } else {
                     tracing::debug!("opoi.capabilities from an unauthorized connection; dropping");

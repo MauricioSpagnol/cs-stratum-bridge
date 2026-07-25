@@ -98,13 +98,15 @@ pub struct Config {
     #[arg(long, env = "B3LITE_AUDIT_SAMPLE_RATE", default_value_t = 0.05)]
     pub b3lite_audit_sample_rate: f64,
 
-    /// Path to a `cs-miner` binary this bridge invokes as a subprocess to
-    /// run the Auditor replay (`cs-miner --audit-request <file>`) — see
-    /// `opoi/b3lite_audit.rs`. Deliberately a LOCAL subprocess the bridge
-    /// operator controls, not a stratum round-trip to an arbitrary
-    /// connected miner: trusting a peer miner to audit another peer miner
-    /// gives no real security margin for an off-chain-only consequence
-    /// (see the B3-lite scope doc's design note on this).
+    /// Path to a `cs-miner` binary this bridge invokes as a LOCAL subprocess
+    /// to run the Auditor replay (`cs-miner --audit-request <file>`) — see
+    /// `opoi/b3lite_audit.rs`. This is the fallback path, always available:
+    /// `AUDITOR_TRUSTED_WALLETS` below is the preferred path when a trusted
+    /// wallet happens to be connected. Both paths share the same trust
+    /// boundary (an audit is only ever run by THIS operator or a wallet
+    /// THIS operator explicitly named as trusted) — dispatching to an
+    /// arbitrary connected miner instead would add no real security (see
+    /// `b3lite_audit.rs`'s module doc).
     #[arg(long, env = "AUDITOR_CS_MINER_BIN", default_value = "cs-miner")]
     pub auditor_cs_miner_bin: String,
 
@@ -116,6 +118,16 @@ pub struct Config {
 
     #[arg(long, env = "B3LITE_AUDIT_POLL_INTERVAL_MS", default_value_t = 30_000)]
     pub b3lite_audit_poll_interval_ms: u64,
+
+    /// Comma-separated wallet addresses this operator trusts to run a real
+    /// audit replay over stratum (`opoi.audit_assign`/`opoi.audit_result`)
+    /// instead of (or before falling back to) the local subprocess — see
+    /// `auditor_cs_miner_bin`'s doc for why this doesn't weaken the trust
+    /// model: dispatch only ever goes to a wallet in THIS list, never to an
+    /// arbitrary connected miner. Empty (the default) means every audit
+    /// runs via the local subprocess only.
+    #[arg(long, env = "AUDITOR_TRUSTED_WALLETS", default_value = "")]
+    pub auditor_trusted_wallets: String,
 }
 
 impl Config {
@@ -150,6 +162,16 @@ impl Config {
     /// empty key, which would be a receipt anyone could forge).
     pub fn b3lite_enabled(&self) -> bool {
         !self.b3lite_receipt_secret.is_empty()
+    }
+
+    /// Parses `auditor_trusted_wallets` into a trimmed, non-empty list —
+    /// same shape `opoi_address_list` gives `opoi_addresses`.
+    pub fn auditor_trusted_wallet_list(&self) -> Vec<String> {
+        self.auditor_trusted_wallets
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect()
     }
 
     pub fn load() -> Self {

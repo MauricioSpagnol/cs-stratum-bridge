@@ -29,12 +29,20 @@ pub struct MinerRegistry {
     /// audits. Deliberately NOT removed from `inner` and NOT disconnected —
     /// PoW `mining.*` traffic is unaffected; only `pick_next`/
     /// `pick_draft_capable` skip a banned wallet, so it simply never
-    /// receives another OPoI assignment. Persists only for this process's
-    /// lifetime (in-memory, like `draft_capable`) — a restart currently
-    /// forgets bans; see `b3lite_audit.rs`'s consequence table for the
-    /// durable record this could be rebuilt from at startup (not done in
-    /// this pass).
+    /// receives another OPoI assignment. In-memory only (like
+    /// `draft_capable`) — but `main.rs` rebuilds this set from the durable
+    /// `b3lite_consequences` table (`db::repo::list_ejected_wallets`) once
+    /// at startup, before any dispatch loop runs, so a restart doesn't
+    /// silently un-eject anyone.
     banned: Mutex<HashSet<String>>,
+    /// B3-lite (see `opoi/b3lite_audit.rs`): wallets that sent
+    /// `opoi.capabilities` with `"auditor"` right after authorize — mirrors
+    /// `draft_capable` exactly. Announcing this alone does NOT make a
+    /// wallet eligible for a real audit dispatch — `pick_auditor_capable`
+    /// also requires the wallet to be in the operator's own
+    /// `AUDITOR_TRUSTED_WALLETS` allow-list (passed in by the caller, not
+    /// stored here — see that method's doc).
+    auditor_capable: Mutex<HashSet<String>>,
 }
 
 impl MinerRegistry {
@@ -43,6 +51,7 @@ impl MinerRegistry {
             inner: Mutex::new(IndexMap::new()),
             draft_capable: Mutex::new(HashSet::new()),
             banned: Mutex::new(HashSet::new()),
+            auditor_capable: Mutex::new(HashSet::new()),
         }
     }
 
@@ -69,6 +78,8 @@ impl MinerRegistry {
         // reconnects and re-announces — stale entries here would otherwise
         // make pick_draft_capable hand out a wallet with no live connection.
         self.draft_capable.lock().remove(wallet);
+        // Same reasoning for `auditor` capability.
+        self.auditor_capable.lock().remove(wallet);
     }
 
     pub fn get(&self, wallet: &str) -> Option<UnboundedSender<String>> {
@@ -137,6 +148,42 @@ impl MinerRegistry {
                     .filter(|(wallet, _)| draft_capable.contains(wallet.as_str()) && !banned.contains(wallet.as_str()))
                     .map(|(wallet, _)| wallet.clone())
             })
+    }
+
+    /// B3-lite: mirrors `mark_draft_capable`, for the `auditor` capability.
+    pub fn mark_auditor_capable(&self, wallet: &str) {
+        if self.inner.lock().contains_key(wallet) {
+            self.auditor_capable.lock().insert(wallet.to_string());
+        }
+    }
+
+    /// Picks a connected wallet eligible for a real audit dispatch: must
+    /// have announced the `auditor` capability, must be in the operator's
+    /// `trusted` allow-list (see `Config::auditor_trusted_wallets` —
+    /// announcing the capability alone is never sufficient, see
+    /// `b3lite_audit.rs`'s module doc on why an arbitrary miner auditing a
+    /// peer adds no security), must not be banned, and must not be
+    /// `exclude_wallet` (the wallet actually being audited — auditing
+    /// yourself proves nothing). No round-robin state here (unlike
+    /// `pick_next`/`pick_draft_capable`): audit dispatch is rare enough
+    /// (a small sampled fraction) that picking the first eligible match is
+    /// fine. `None` if no eligible wallet is connected right now — callers
+    /// must treat that as "fall back to the local subprocess auditor", not
+    /// an error.
+    pub fn pick_auditor_capable(&self, trusted: &[String], exclude_wallet: &str) -> Option<String> {
+        let inner = self.inner.lock();
+        let auditor_capable = self.auditor_capable.lock();
+        let banned = self.banned.lock();
+
+        trusted
+            .iter()
+            .find(|wallet| {
+                wallet.as_str() != exclude_wallet
+                    && inner.contains_key(wallet.as_str())
+                    && auditor_capable.contains(wallet.as_str())
+                    && !banned.contains(wallet.as_str())
+            })
+            .cloned()
     }
 }
 

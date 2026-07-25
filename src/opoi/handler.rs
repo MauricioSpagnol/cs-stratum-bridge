@@ -6,7 +6,7 @@
 use async_trait::async_trait;
 
 use crate::error::AppError;
-use crate::opoi::wire::{OpoiDraftResult, OpoiKvRollbackAck, OpoiShardResult, OpoiSubmitResultParams};
+use crate::opoi::wire::{OpoiAuditResult, OpoiDraftResult, OpoiKvRollbackAck, OpoiShardResult, OpoiSubmitResultParams};
 
 #[async_trait]
 pub trait OpoiHandler: Send + Sync {
@@ -64,6 +64,24 @@ pub trait SpeculativeHandler: Send + Sync {
     /// `opoi.kv_rollback_ack` (the reply to a previously-pushed
     /// `opoi.kv_rollback`).
     async fn handle_kv_rollback_ack(&self, wallet: &str, ack: OpoiKvRollbackAck);
+
+    /// Mirrors `ShardHandler::on_disconnect`.
+    async fn on_disconnect(&self, wallet: &str);
+}
+
+/// B3-lite (2026-07-25 session): the audit-dispatch counterpart of
+/// `ShardHandler` — kept as its own trait, same reasoning as the others
+/// (`B3LiteAuditor` is a distinct component, see `b3lite_audit.rs`'s
+/// module doc).
+#[async_trait]
+pub trait AuditHandler: Send + Sync {
+    /// Called when an authorized downstream connection sends
+    /// `opoi.audit_result` (the reply to a previously-pushed
+    /// `opoi.audit_assign`). Returns an `AppError` if this wallet wasn't
+    /// the one dispatched to for `result.request_id` (or no dispatch is
+    /// outstanding for it at all) — same "assignment verification" contract
+    /// `ShardHandler::handle_shard_result` has.
+    async fn handle_audit_result(&self, wallet: &str, result: OpoiAuditResult) -> Result<(), AppError>;
 
     /// Mirrors `ShardHandler::on_disconnect`.
     async fn on_disconnect(&self, wallet: &str);

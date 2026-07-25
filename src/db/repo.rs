@@ -510,6 +510,21 @@ pub async fn count_withhold_consequences(pool: &PgPool, miner_wallet: &str) -> R
     Ok(row.try_get::<i64, _>("n")?)
 }
 
+/// Every wallet with at least one durable `EJECTED` consequence row —
+/// called once at startup (see `main.rs`) to rebuild
+/// `MinerRegistry`'s in-memory `banned` set, which otherwise forgets every
+/// ejection on a restart (see that field's doc comment).
+pub async fn list_ejected_wallets(pool: &PgPool) -> Result<Vec<String>, AppError> {
+    let rows =
+        sqlx::query(r#"SELECT DISTINCT miner_wallet FROM b3lite_consequences WHERE action = 'EJECTED'"#).fetch_all(pool).await?;
+
+    let mut wallets = Vec::with_capacity(rows.len());
+    for row in rows {
+        wallets.push(row.try_get::<String, _>("miner_wallet")?);
+    }
+    Ok(wallets)
+}
+
 /// Appends an entry to the stake-event audit log.
 pub async fn log_stake_event(
     pool: &PgPool,
@@ -593,6 +608,16 @@ mod b3lite_repo_tests {
             .expect("insert consequence");
         let count = count_withhold_consequences(&pool, wallet).await.expect("count consequences");
         assert!(count >= 1);
+
+        // Not yet EJECTED — only a single WITHHOLD_PAY so far.
+        let ejected = list_ejected_wallets(&pool).await.expect("list ejected wallets");
+        assert!(!ejected.contains(&wallet.to_string()), "one divergence alone shouldn't eject");
+
+        insert_b3lite_consequence(&pool, sampled_id, wallet, &sampled_request_id, "EJECTED", "3 confirmed divergences")
+            .await
+            .expect("insert EJECTED consequence");
+        let ejected = list_ejected_wallets(&pool).await.expect("list ejected wallets after EJECTED insert");
+        assert!(ejected.contains(&wallet.to_string()), "wallet with an EJECTED row must be listed");
 
         // create_submission + list_unpaid_published: the withheld request_id
         // must be excluded even though it's PUBLISHED and unpaid.

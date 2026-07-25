@@ -270,3 +270,75 @@ pub fn build_shard_result_error(id: serde_json::Value, error_triple: serde_json:
     });
     format!("{}\n", msg)
 }
+
+// ── B3-lite audit messages (2026-07-25 session) ──────────────────────────
+//
+// Field names/shapes match cs-miner's `src/pow/stratum.rs` byte-for-byte —
+// same shared-contract convention as every other message pair here. Only
+// ever pushed to a miner that announced the `auditor` capability AND whose
+// wallet is in this operator's own `AUDITOR_TRUSTED_WALLETS` — see
+// `b3lite_audit.rs`'s module doc for why dispatching to an arbitrary
+// connected miner instead would add no real security.
+
+/// Pushed downstream (bridge -> miner) as an `opoi.audit_assign`
+/// notification: everything `cs-miner`'s `opoi::auditor::AuditRequest`
+/// needs, already resolved by `b3lite_audit.rs` from the receipt row +
+/// `ModelSourceConfig` — the miner never talks to this bridge's DB.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OpoiAuditAssign {
+    pub request_id: String,
+    pub model_id: String,
+    pub gguf_url: String,
+    pub gguf_sha256: String,
+    pub tokenizer_url: String,
+    pub tokenizer_sha256: String,
+    pub prompt_hex: String,
+    pub committed_token_ids: Vec<u32>,
+    pub total_layers: u32,
+}
+
+/// Mirrors cs-miner's `opoi::auditor::PositionVerdict` field-for-field.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuditPositionWire {
+    pub step: usize,
+    pub committed_token_id: u32,
+    pub auditor_token_id: u32,
+    pub admissible: bool,
+}
+
+/// Received from a downstream miner as `opoi.audit_result`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OpoiAuditResult {
+    pub request_id: String,
+    pub positions: Vec<AuditPositionWire>,
+}
+
+pub fn build_audit_assign_line(assign: &OpoiAuditAssign) -> String {
+    let msg = serde_json::json!({
+        "jsonrpc": "2.0",
+        "method": "opoi.audit_assign",
+        "params": [assign],
+        "id": serde_json::Value::Null,
+    });
+    format!("{}\n", msg)
+}
+
+pub fn build_audit_result_ack(id: serde_json::Value) -> String {
+    let msg = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "result": { "accepted": true },
+        "error": serde_json::Value::Null,
+    });
+    format!("{}\n", msg)
+}
+
+pub fn build_audit_result_error(id: serde_json::Value, error_triple: serde_json::Value) -> String {
+    let msg = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "result": serde_json::Value::Null,
+        "error": error_triple,
+    });
+    format!("{}\n", msg)
+}
