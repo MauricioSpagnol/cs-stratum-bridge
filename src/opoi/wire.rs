@@ -101,6 +101,25 @@ pub struct OpoiShardAssign {
     pub model_tokenizer_url: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_tokenizer_sha256: Option<String>,
+    /// D2 multi-layer STATEFUL resume (2026-07-26 follow-up session — see
+    /// cs-miner's `opoi::moe_range_session` module doc for the full
+    /// protocol; mirrors `pow::stratum::OpoiShardAssign::moe_layer_step`
+    /// byte-for-byte). `Some(layer_idx)` means this assign is ONE STEP of a
+    /// per-layer walk through a MoE dense-boundary range: `layer_idx` is
+    /// the ABSOLUTE layer this step computes the real router-only output
+    /// for (must fall inside `[layer_start, layer_end)`).
+    ///   - `layer_idx == layer_start` (the FIRST step of a fresh walk):
+    ///     `input` is the ordinary entry for this shard (unchanged
+    ///     meaning).
+    ///   - `layer_idx > layer_start` (a RESUME step): `input` is ALWAYS
+    ///     `Tensor` and carries the externally router-weighted-COMBINED
+    ///     FFN output of layer `layer_idx - 1` — see
+    ///     `ShardEngine::handle_moe_interior_layer_result`.
+    /// `None` (the default) preserves every existing behavior byte-for-
+    /// byte, including the OLD whole-range-in-one-shot dispatch this
+    /// supersedes for a miner that supports the new protocol.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub moe_layer_step: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -176,6 +195,16 @@ pub struct OpoiShardResult {
     /// layer_end)` bounds as it does today.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub router_selection: Option<Vec<Vec<RouterExpertChoice>>>,
+    /// Echoes `OpoiShardAssign::moe_layer_step` back — `Some(layer_idx)`
+    /// marks this result as ONE STEP of a stateful per-layer range walk.
+    /// When set, `router_selection` (if present) has EXACTLY ONE entry
+    /// (`layer_idx`'s own real selection) — `handle_expert_group_result`'s
+    /// existing `.last()`-based extraction needs no shape-specific branch
+    /// for this mode (a length-1 `Vec`'s `.last()` is just that one entry).
+    /// `None` for every ordinary dense shard and for the OLD
+    /// whole-range-in-one-shot MoE path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub moe_layer_step: Option<u32>,
 }
 
 /// One expert the primary router selected for a `(layer_start, layer_end)`
@@ -424,6 +453,20 @@ pub struct OpoiExpertAssign {
     pub model_id: String,
     pub layer_start: u32,
     pub layer_end: u32,
+    /// D2 multi-layer follow-up (2026-07-26): the ABSOLUTE layer index this
+    /// dispatch's `expert_id` FFN actually runs at. Real bug found and
+    /// fixed in the same session that added this field: before it existed,
+    /// this role's `expert_pool_client.rs::compute` required `layer_end ==
+    /// layer_start + 1` (treating `layer_start` itself as the absolute
+    /// layer), but this engine always dispatched using the OWNING dense
+    /// shard's own `(layer_start, layer_end)` range bounds — for any range
+    /// wider than one layer, that would always be rejected by the miner
+    /// even though nothing here was wrong. `layer_start`/`layer_end` above
+    /// now stay purely the owning range's bounds (context/logging only);
+    /// `layer_idx` is what actually gets dispatched, and part of
+    /// `ExpertAssignmentKey` so two different layers' fan-outs within the
+    /// same range never collide.
+    pub layer_idx: u32,
     pub expert_id: u32,
     /// 0 = first token of the generation; >0 = a continuation step —
     /// mirrors `OpoiShardAssign::token_index`.
@@ -464,6 +507,8 @@ pub struct OpoiExpertResult {
     pub request_id: String,
     pub layer_start: u32,
     pub layer_end: u32,
+    /// Echoes `OpoiExpertAssign::layer_idx` back — see that field's doc.
+    pub layer_idx: u32,
     pub expert_id: u32,
     pub token_index: u32,
     pub output_hash: String,

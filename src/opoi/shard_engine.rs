@@ -58,32 +58,53 @@
 //! a retry mechanism exists" acceptance this file already documents for
 //! submit failures below) — it never fabricates a selection.
 //!
-//! **Known gap, not guessed around (2026-07-26, multi-layer follow-up
-//! session):** a dense-boundary range CAN legally span more than one
-//! layer (cloudservice's `SplitLayerRanges` is a plain even split, nothing
-//! requires `numDenseShards == numLayers` for a MoE manifest — see
-//! cs-miner's D2 session report for the exact derivation), and cs-miner now
-//! reports a genuine, independently-correct real router selection for
-//! EVERY layer in such a range (`router_selection`'s per-layer shape
-//! above). This engine, however, still only externally dispatches the
-//! RANGE's LAST layer's selection (`handle_expert_group_result` reads
-//! `.last()`) — `ExpertDispatcher::dispatch_and_join` keys a dispatch by
-//! the whole `(layer_start, layer_end)` range, not by an absolute layer
-//! index within it, so there is no way yet to fan out an INTERIOR layer's
-//! experts to separate machines and feed their combined result back to the
-//! SAME primary before it continues to the next layer within the range —
-//! that would need a genuinely new intermediate `PipelineState` (something
-//! like "mid-range, at layer offset K of N, holding this intermediate
-//! combined hidden state", not just today's single `pos`/`current_input`)
-//! plus per-layer dispatch keys, a real redesign left for a follow-up
-//! session (see this crate's D2 session report for the full punch list).
-//! Interior layers' selections are consequently accepted, bounds-checked,
-//! and available for a future Auditor sub-check (i) replay, but NOT (yet)
-//! turned into real network dispatch — this is a documented, honest
-//! stopping point, not a silent one: it does not change behavior for the
-//! single-layer-range case (`.last()` is the ONLY entry then, same as
-//! before this session), and it never silently drops or misattributes an
-//! interior layer's real data.
+//! **Gap CLOSED (2026-07-26, multi-layer STATEFUL resume follow-up
+//! session):** a dense-boundary range CAN legally span more than one layer
+//! (cloudservice's `SplitLayerRanges` is a plain even split, nothing
+//! requires `numDenseShards == numLayers` for a MoE manifest), and EVERY
+//! layer in such a range is now genuinely, externally dispatched — not
+//! just the range's last one. `PipelineState::moe_layer_walk` (see its own
+//! doc comment) is the "genuinely new intermediate state" the PREVIOUS
+//! session's note here called for: `Some((next_layer_idx, pinned_wallet))`
+//! tracks "mid-range, at absolute layer `next_layer_idx`, pinned to the
+//! wallet already holding this walk's open session" — a thin addition to
+//! the existing `pos`/`current_input` shape, not a parallel state machine.
+//! `dispatch_current` sets `OpoiShardAssign::moe_layer_step` to drive this
+//! (`Some(layer_start)` on the FIRST dispatch for a range with a registered
+//! EXPERT group, `Some(next_layer_idx)` on every resume — see that method's
+//! doc); `handle_shard_result_inner` intercepts any INTERIOR-layer result
+//! (`moe_layer_step` set, not yet the range's last layer) and routes it to
+//! `handle_moe_interior_layer_result` — real dispatch/combine via
+//! `ExpertDispatcher::dispatch_and_join` (now keyed by an explicit absolute
+//! `layer_idx`, not just the range's bounds — see `expert_dispatch.rs`'s
+//! `ExpertAssignmentKey` doc), but NEITHER submits on-chain NOR advances
+//! `pos` — only the BOUNDARY layer's result (still handled by
+//! `handle_expert_group_result`, essentially unchanged in substance) does
+//! either of those, preserving the pre-existing "exactly one on-chain
+//! submission per real dense shard_index" invariant untouched: the chain
+//! never sees how many internal per-layer round trips happened before that
+//! submission, only that it happened once, keyed the same way it always
+//! was (see this crate's D2 session report, "on-chain submission-timing
+//! choice", for the full reasoning this was checked against).
+//!
+//! A resume step MUST go back to the EXACT wallet pinned in
+//! `moe_layer_walk` (never round-robin) — that wallet's own
+//! `moe_range_session.rs` (cs-miner) is the only place the residual/KV
+//! state needed to finish an interior layer's combine actually lives. If
+//! that wallet disconnects mid-walk, `dispatch_current` drops the whole
+//! pipeline rather than silently resuming against a different miner that
+//! never computed the held-open state (see
+//! `dispatch_current_drops_pipeline_when_pinned_wallet_for_a_mid_walk_resume_is_gone`).
+//!
+//! The OLD whole-range-in-one-shot path (`compute_moe_router_only`/
+//! `route_only_over_range` on cs-miner's side, `handle_expert_group_result`
+//! reading a MULTI-entry `router_selection` here) still exists and is still
+//! exercised by `moe_multi_layer_range_dispatches_only_last_layer_selection`
+//! below — it fires whenever a result's `moe_layer_step` is `None` (an
+//! older cs-miner build, or any future caller that opts out of the new
+//! protocol), and remains the documented fallback per this session's design
+//! decision (see cs-miner's `route_only_over_range` doc comment for the
+//! symmetric choice on that side).
 //!
 //! A second, narrower gap, unchanged from before: the LAST dense shard of a
 //! MoE pipeline can also have a registered EXPERT group (every layer range
@@ -220,6 +241,25 @@ struct PipelineState {
     /// pure-DENSE path byte-for-byte unchanged (`expert_group_for` always
     /// returns `None`).
     expert_groups: HashMap<(u32, u32), Vec<u32>>,
+    /// D2 multi-layer STATEFUL resume (2026-07-26 follow-up session — see
+    /// cs-miner's `opoi::moe_range_session` module doc for the miner-side
+    /// half of this protocol). `Some((next_layer_idx, pinned_wallet))`
+    /// while the CURRENT shard (`shards[pos]`) is being walked layer-by-
+    /// layer through a registered EXPERT range: `next_layer_idx` is the
+    /// ABSOLUTE layer index the next (or currently in-flight)
+    /// `opoi.shard_assign` for THIS SAME shard/pos should request via
+    /// `moe_layer_step`, and `pinned_wallet` is the wallet already holding
+    /// that range-walk's open session on its own side. A resume step MUST
+    /// go back to this EXACT wallet, never round-robin to a different one
+    /// — the session/residual state genuinely only exists on that one
+    /// machine (see cs-miner's `moe_range_session.rs` doc for why). `None`
+    /// whenever `pos`'s shard isn't (yet, or ever) being walked this way —
+    /// a plain dense shard, or a fresh shard whose first dispatch hasn't
+    /// happened yet. Reset to `None` whenever `pos` advances to a new
+    /// shard (both the plain dense-to-dense handoff and the MoE boundary
+    /// handoff clear it) so the next shard's dispatch decision is made
+    /// fresh, not inherited from the shard that just finished.
+    moe_layer_walk: Option<(u32, String)>,
 }
 
 impl PipelineState {
@@ -246,6 +286,14 @@ struct ShardAssignment {
     wallet: String,
     shard_index: u32,
     token_index: u32,
+    /// D2 multi-layer STATEFUL resume: echoes what `dispatch_current`
+    /// actually asked for via `OpoiShardAssign::moe_layer_step` — validated
+    /// against the miner's reply's OWN `moe_layer_step` before it's
+    /// accepted (`handle_shard_result_inner`), so a stale/duplicate reply
+    /// for a DIFFERENT layer step of the same shard/token can't be
+    /// mistaken for the current one. `None` for a plain dense shard or the
+    /// OLD whole-range-in-one-shot MoE path.
+    moe_layer_step: Option<u32>,
 }
 
 pub struct ShardEngine {
@@ -421,6 +469,7 @@ impl ShardEngine {
                     generated_token_ids: Vec::new(),
                     contributions: BTreeMap::new(),
                     expert_groups,
+                    moe_layer_walk: None,
                 },
             );
             self.prompt_cache.remove(&req.request_id);
@@ -450,43 +499,125 @@ impl ShardEngine {
         }
     }
 
+    /// D2 multi-layer STATEFUL resume (2026-07-26 follow-up session): now
+    /// makes TWO decisions instead of one:
+    ///   1. Which WALLET to dispatch to. Ordinarily this always
+    ///      round-robins (`MinerRegistry::pick_next`) — but a RESUME step
+    ///      of a per-layer walk (`pipeline.moe_layer_walk` already
+    ///      `Some`) MUST go back to the EXACT wallet already holding that
+    ///      walk's open session (see `PipelineState::moe_layer_walk`'s doc
+    ///      for why — the residual/KV state genuinely only exists there).
+    ///      If that pinned wallet is no longer connected, the whole
+    ///      pipeline is dropped rather than silently resuming against a
+    ///      different machine that never computed the held-open state.
+    ///   2. Whether to set `moe_layer_step` at all. ANY dense shard with a
+    ///      registered EXPERT group (any range length — see this file's
+    ///      module doc for why length no longer matters) now uses the new
+    ///      per-layer walk protocol UNCONDITIONALLY going forward: the
+    ///      FIRST dispatch for such a shard pins a wallet and sets
+    ///      `moe_layer_walk = Some((layer_start, wallet))`; every
+    ///      subsequent call for the SAME shard/pos (until it advances)
+    ///      just re-reads that pinned state. A plain dense shard (no
+    ///      EXPERT group) is completely unaffected — `moe_layer_step`
+    ///      stays `None`, byte-for-byte the same dispatch as before this
+    ///      session.
     async fn dispatch_current(&self, request_id: &str, source: &ModelSource) {
-        let Some(pipeline) = self.pipelines.get(request_id) else { return };
-        let shard = &pipeline.shards[pipeline.pos];
-        let is_entry = pipeline.pos == 0;
+        struct Snapshot {
+            shard_index: u32,
+            layer_start: u32,
+            layer_end: u32,
+            total_layers: u32,
+            token_index: u32,
+            max_tokens: u32,
+            model_id: String,
+            gguf_sha256: String,
+            current_input: ShardInputWire,
+            is_entry: bool,
+            needs_walk: bool,
+            moe_layer_walk: Option<(u32, String)>,
+        }
+        let Some(snap) = self.pipelines.get(request_id).map(|pipeline| {
+            let shard = &pipeline.shards[pipeline.pos];
+            Snapshot {
+                shard_index: shard.shard_index,
+                layer_start: shard.layer_start.unwrap_or(0),
+                layer_end: shard.layer_end.unwrap_or(0),
+                total_layers: pipeline.manifest.num_layers,
+                token_index: pipeline.token_index,
+                max_tokens: pipeline.max_tokens,
+                model_id: pipeline.manifest.model_id.clone(),
+                gguf_sha256: pipeline.manifest.backbone_pom_root.clone(),
+                current_input: pipeline.current_input.clone(),
+                is_entry: pipeline.pos == 0,
+                needs_walk: pipeline.expert_group_for(pipeline.pos).is_some(),
+                moe_layer_walk: pipeline.moe_layer_walk.clone(),
+            }
+        }) else {
+            return;
+        };
 
-        let wallet = {
-            let mut last = self.last_assigned.lock();
-            let Some(wallet) = self.registry.pick_next(&last) else {
-                tracing::debug!(request_id = %request_id, "no miners connected right now, will retry dispatching this shard next tick");
-                return;
-            };
-            *last = Some(wallet.clone());
-            wallet
+        let (wallet, moe_layer_step) = match snap.moe_layer_walk {
+            Some((layer_idx, pinned_wallet)) => {
+                if self.registry.get(&pinned_wallet).is_none() {
+                    tracing::error!(
+                        request_id = %request_id, wallet = %pinned_wallet, layer_idx,
+                        "D2 multi-layer walk: the wallet holding this range-walk's open session is no longer connected — \
+                         its residual/KV state cannot be recovered from a different miner; dropping the pipeline rather \
+                         than silently resuming against a machine that never computed it"
+                    );
+                    self.pipelines.remove(request_id);
+                    self.assignments.remove(request_id);
+                    return;
+                }
+                (pinned_wallet, Some(layer_idx))
+            }
+            None => {
+                let wallet = {
+                    let mut last = self.last_assigned.lock();
+                    let Some(wallet) = self.registry.pick_next(&last) else {
+                        tracing::debug!(request_id = %request_id, "no miners connected right now, will retry dispatching this shard next tick");
+                        return;
+                    };
+                    *last = Some(wallet.clone());
+                    wallet
+                };
+                if snap.needs_walk {
+                    if let Some(mut pipeline) = self.pipelines.get_mut(request_id) {
+                        pipeline.moe_layer_walk = Some((snap.layer_start, wallet.clone()));
+                    }
+                    (wallet, Some(snap.layer_start))
+                } else {
+                    (wallet, None)
+                }
+            }
         };
         let Some(tx) = self.registry.get(&wallet) else { return };
 
         let assign = OpoiShardAssign {
             request_id: request_id.to_string(),
-            model_id: pipeline.manifest.model_id.clone(),
-            shard_index: shard.shard_index,
-            layer_start: shard.layer_start.unwrap_or(0),
-            layer_end: shard.layer_end.unwrap_or(0),
-            total_layers: pipeline.manifest.num_layers,
-            token_index: pipeline.token_index,
-            max_tokens: pipeline.max_tokens,
-            input: pipeline.current_input.clone(),
+            model_id: snap.model_id,
+            shard_index: snap.shard_index,
+            layer_start: snap.layer_start,
+            layer_end: snap.layer_end,
+            total_layers: snap.total_layers,
+            token_index: snap.token_index,
+            max_tokens: snap.max_tokens,
+            input: snap.current_input,
             model_gguf_url: source.gguf_url.clone(),
-            model_gguf_sha256: pipeline.manifest.backbone_pom_root.clone(),
-            model_tokenizer_url: is_entry.then(|| source.tokenizer_url.clone()),
-            model_tokenizer_sha256: is_entry.then(|| source.tokenizer_sha256.clone()),
+            model_gguf_sha256: snap.gguf_sha256,
+            model_tokenizer_url: snap.is_entry.then(|| source.tokenizer_url.clone()),
+            model_tokenizer_sha256: snap.is_entry.then(|| source.tokenizer_sha256.clone()),
+            moe_layer_step,
         };
         self.assignments.insert(
             request_id.to_string(),
-            ShardAssignment { wallet: wallet.clone(), shard_index: shard.shard_index, token_index: pipeline.token_index },
+            ShardAssignment { wallet: wallet.clone(), shard_index: snap.shard_index, token_index: snap.token_index, moe_layer_step },
         );
         let _ = tx.send(build_shard_assign_line(&assign));
-        tracing::info!(request_id = %request_id, shard_index = shard.shard_index, token_index = pipeline.token_index, wallet = %wallet, "dispatched shard");
+        tracing::info!(
+            request_id = %request_id, shard_index = snap.shard_index, token_index = snap.token_index, wallet = %wallet, ?moe_layer_step,
+            "dispatched shard"
+        );
     }
 
     /// Called when a miner sends `opoi.shard_result`. Advances the pipeline
@@ -516,7 +647,11 @@ impl ShardEngine {
             let Some(assignment) = self.assignments.get(&request_id) else {
                 return Err(crate::error::AppError::UnknownRequest);
             };
-            if assignment.wallet != wallet || assignment.shard_index != result.shard_index || assignment.token_index != result.token_index {
+            if assignment.wallet != wallet
+                || assignment.shard_index != result.shard_index
+                || assignment.token_index != result.token_index
+                || assignment.moe_layer_step != result.moe_layer_step
+            {
                 return Err(crate::error::AppError::NotAssignedToCaller);
             }
         }
@@ -529,9 +664,42 @@ impl ShardEngine {
         // Payout-attribution bookkeeping (see `PipelineState::contributions`
         // doc comment): every accepted shard result is one real unit of
         // compute delivered by `wallet`, whether or not it turns out to be
-        // the pipeline's last step.
+        // the pipeline's last step (or, for a multi-layer walk, the
+        // boundary step).
         if let Some(mut pipeline) = self.pipelines.get_mut(&request_id) {
             *pipeline.contributions.entry(wallet.to_string()).or_insert(0) += 1;
+        }
+
+        // D2 multi-layer STATEFUL resume (2026-07-26 follow-up session):
+        // if this result is ONE STEP of a per-layer walk (`moe_layer_step`
+        // set) AND it's an INTERIOR layer (not this range's last layer),
+        // this is NOT a submission point and does NOT advance `pos` — it
+        // must be handled and returned BEFORE the on-chain submission
+        // logic below, which only ever makes sense once per real dense
+        // shard_index, not once per internal layer round trip. Falls
+        // through to the EXISTING logic (unchanged) for every other case:
+        // a plain dense shard (`moe_layer_step == None`), the OLD
+        // whole-range-in-one-shot MoE path (also `None`), AND the
+        // BOUNDARY layer of a new-protocol walk (`moe_layer_step ==
+        // Some(layer_end - 1)`) — that last case is deliberately treated
+        // exactly like the OLD path always was: `handle_expert_group_result`
+        // below now takes an explicit `layer_idx` so it dispatches the
+        // correct absolute layer either way.
+        if let Some(layer_idx) = result.moe_layer_step {
+            let layer_end = { self.pipelines.get(&request_id).map(|p| p.shards[p.pos].layer_end.unwrap_or(0)) };
+            let Some(layer_end) = layer_end else { return Err(crate::error::AppError::UnknownRequest) };
+            if layer_end == 0 || layer_idx + 1 < layer_end {
+                let expert_ids = { self.pipelines.get(&request_id).and_then(|p| p.expert_group_for(p.pos).cloned()) };
+                let Some(expert_ids) = expert_ids else {
+                    tracing::error!(
+                        request_id = %request_id, layer_idx,
+                        "D2 multi-layer walk: result carried moe_layer_step but this shard's range has no registered EXPERT group — dropping pipeline"
+                    );
+                    self.pipelines.remove(&request_id);
+                    return Ok(());
+                };
+                return self.handle_moe_interior_layer_result(&request_id, &source, expert_ids, layer_idx, &result).await;
+            }
         }
 
         // Every shard gets exactly ONE on-chain submission per request — at
@@ -579,13 +747,24 @@ impl ShardEngine {
                 // MoE fan-out step: this shard's output is the router
                 // boundary hidden state for `expert_ids`, not directly the
                 // next dense shard's input — see `handle_expert_group_result`.
-                return self.handle_expert_group_result(&request_id, &source, expert_ids, &result).await;
+                // `layer_idx`: `result.moe_layer_step` for a new-protocol
+                // boundary result, or the implicit `layer_end - 1` the OLD
+                // whole-range-in-one-shot path always operated on
+                // (`.last()` of its nested `router_selection`) when
+                // `moe_layer_step` is `None` — identical value either way.
+                let layer_end = { self.pipelines.get(&request_id).map(|p| p.shards[p.pos].layer_end.unwrap_or(0)) }.unwrap_or(0);
+                let layer_idx = result.moe_layer_step.unwrap_or(layer_end.saturating_sub(1));
+                return self.handle_expert_group_result(&request_id, &source, expert_ids, layer_idx, &result).await;
             }
             // Advance to the next shard in the SAME token step, feeding it
             // this shard's real output tensor.
             if let Some(mut pipeline) = self.pipelines.get_mut(&request_id) {
                 pipeline.pos += 1;
                 pipeline.current_input = ShardInputWire::Tensor { shape: result.output.shape.clone(), data_hex: result.output.data_hex.clone() };
+                // See `PipelineState::moe_layer_walk`'s doc — always `None`
+                // already on this plain dense-to-dense path, reset anyway
+                // for defense in depth.
+                pipeline.moe_layer_walk = None;
             }
             self.dispatch_current(&request_id, &source).await;
             return Ok(());
@@ -635,6 +814,7 @@ impl ShardEngine {
             pipeline.pos = 0;
             pipeline.token_index += 1;
             pipeline.current_input = ShardInputWire::NextTokenId { token_id: next_token_id };
+            pipeline.moe_layer_walk = None;
         }
         self.dispatch_current(&request_id, &source).await;
         Ok(())
@@ -656,28 +836,39 @@ impl ShardEngine {
     /// uses, just with the combined expert output standing in for a plain
     /// shard's `result.output`.
     ///
-    /// D2 multi-layer follow-up (2026-07-26, later session):
-    /// `router_selection` is now `Vec<Vec<RouterExpertChoice>>`, one entry
-    /// per LAYER within the range (see `wire.rs`'s doc comment for the full
-    /// shape rationale — mirrors `pinned_expert_ids`'s convention). This
-    /// method validates and bounds-checks EVERY layer's entry (real,
-    /// genuine data for all of them — see cs-miner's
-    /// `route_only_over_range` doc for why), but still only externally
-    /// dispatches the RANGE's LAST layer's selection (`selections.last()`)
-    /// — `ExpertDispatcher`/`PipelineState` don't yet key a dispatch by
-    /// absolute layer index within a range, only by the range's own
-    /// `(layer_start, layer_end)` bounds, so there's no consumer yet for an
-    /// INTERIOR layer's selection to be turned into real network dispatch
-    /// (see this file's module doc for the full derivation — a documented,
-    /// honest stopping point, not a silent gap). For a single-layer range
-    /// (`layer_end == layer_start + 1`, the common case today) `.last()` is
-    /// the ONLY entry, so this is byte-for-byte the same behavior this
-    /// method always had.
+    /// D2 multi-layer STATEFUL resume (2026-07-26, later follow-up
+    /// session): this method is now ONLY ever called for the RANGE'S LAST
+    /// (boundary) LAYER's result — the caller (`handle_shard_result_inner`)
+    /// intercepts and redirects any INTERIOR layer step to
+    /// `handle_moe_interior_layer_result` before this method is ever
+    /// reached, and never advances `pos`/submits on-chain for one (see that
+    /// method's doc). This method's own logic is consequently unchanged in
+    /// SUBSTANCE from before that split existed — it still validates and
+    /// bounds-checks `router_selection`'s entries, still dispatches via
+    /// `ExpertDispatcher::dispatch_and_join`, still advances `pos` and
+    /// feeds the combined output forward as the next dense shard's input —
+    /// the only two real changes are (1) it now takes an explicit
+    /// `layer_idx: u32` (the ABSOLUTE layer being dispatched — either
+    /// `result.moe_layer_step` for a new-protocol boundary result, or the
+    /// implicit `layer_end - 1` the OLD whole-range-in-one-shot path always
+    /// operated on, identical value either way) threaded through to
+    /// `dispatch_and_join`'s new `layer_idx` parameter, and (2) it clears
+    /// `pipeline.moe_layer_walk` before advancing `pos` (so the NEXT
+    /// shard's dispatch decision is made fresh, not inherited).
+    ///
+    /// `router_selection` is `Vec<Vec<RouterExpertChoice>>` — for the OLD
+    /// whole-range-in-one-shot path this has one entry per LAYER within the
+    /// range (`.last()` is the boundary's); for the NEW per-layer-walk
+    /// protocol it always has EXACTLY ONE entry (this layer's own
+    /// selection — see `OpoiShardResult::moe_layer_step`'s doc comment for
+    /// why the shape was deliberately kept the same so `.last()` needs no
+    /// branch either way).
     async fn handle_expert_group_result(
         &self,
         request_id: &str,
         source: &ModelSource,
         expert_ids: Vec<u32>,
+        layer_idx: u32,
         result: &crate::opoi::wire::OpoiShardResult,
     ) -> Result<(), crate::error::AppError> {
         // `router_selection` is the seam that carries the PRIMARY miner's
@@ -724,23 +915,27 @@ impl ShardEngine {
         }
 
         if per_layer_selections.len() > 1 {
-            // Interior layers: genuine, real, bounds-checked router data —
-            // recorded (for now, just logged) for a future Auditor
-            // sub-check (i) replay, NOT yet turned into external dispatch
-            // (see this method's doc comment and this file's module doc
-            // for exactly why, and what a follow-up would need to change).
+            // Only ever reachable via the OLD whole-range-in-one-shot path
+            // now (the NEW per-layer-walk protocol always reports exactly
+            // one entry per result — see this method's doc comment):
+            // interior layers' selections are genuine, real, bounds-checked
+            // router data, informational only for that OLD path (a future
+            // Auditor sub-check (i) replay could use them), not turned into
+            // external dispatch by IT specifically — the caller
+            // (`handle_shard_result_inner`) routes every NEW-protocol
+            // interior-layer result to `handle_moe_interior_layer_result`
+            // instead, which DOES dispatch them.
             tracing::info!(
                 request_id = %request_id, shard_index = result.shard_index, interior_layers = per_layer_selections.len() - 1,
-                "D2: multi-layer range — {} interior layer(s)' real router selections received and validated, but not yet \
-                 externally dispatched (still local-combine only on the primary) — only the range's last layer is dispatched below",
+                "D2 (OLD whole-range-in-one-shot path): {} interior layer(s)' real router selections received and validated, but not \
+                 externally dispatched by this path (still local-combine only on the primary) — only the range's last layer is dispatched below",
                 per_layer_selections.len() - 1
             );
         }
 
-        // Only the range's LAST layer's selection is actually turned into
-        // external per-expert dispatch today — see this method's doc
-        // comment. For a single-layer range this is the only entry, so
-        // behavior is unchanged from before this session.
+        // The range's LAST (boundary) layer's selection — the ONLY entry
+        // for the NEW per-layer-walk protocol, the LAST of several for the
+        // OLD whole-range-in-one-shot path. See this method's doc comment.
         let selections = per_layer_selections.last().expect("checked non-empty above");
 
         let Ok(input_values) = hex_to_f32(&result.output.data_hex) else {
@@ -771,15 +966,20 @@ impl ShardEngine {
         // header not parseable, unsupported dtype, ...) falls back to the
         // pre-follow-up behavior — no floor at all — rather than stalling
         // the whole MoE dispatch over an unavailable VRAM estimate.
+        // Per-LAYER VRAM estimate now (`layer_idx, layer_idx + 1`), not the
+        // whole owning range — more precise once every layer is dispatched
+        // individually (each layer's experts can have a different real
+        // size), and correct either way since `min_vram_mb_for_range`
+        // already takes an arbitrary sub-range.
         let min_vram_mb = self
             .expert_vram
-            .min_vram_mb_for_range(&model_id, &source.gguf_url, &gguf_sha256, layer_start, layer_end, expert_ids.len() as u64)
+            .min_vram_mb_for_range(&model_id, &source.gguf_url, &gguf_sha256, layer_idx, layer_idx + 1, expert_ids.len() as u64)
             .await
             .unwrap_or(0);
 
         let combined = self
             .expert_dispatcher
-            .dispatch_and_join(request_id, layer_start, layer_end, token_index, &model_id, &source.gguf_url, &gguf_sha256, experts, move |_expert_id| min_vram_mb)
+            .dispatch_and_join(request_id, layer_start, layer_end, layer_idx, token_index, &model_id, &source.gguf_url, &gguf_sha256, experts, move |_expert_id| min_vram_mb)
             .await;
 
         match combined {
@@ -787,6 +987,10 @@ impl ShardEngine {
                 if let Some(mut pipeline) = self.pipelines.get_mut(request_id) {
                     pipeline.pos += 1;
                     pipeline.current_input = ShardInputWire::Tensor { shape: output.shape, data_hex: output.data_hex };
+                    // See `PipelineState::moe_layer_walk`'s doc — this
+                    // shard's walk (if any) just finished; the next
+                    // shard's dispatch decision must be made fresh.
+                    pipeline.moe_layer_walk = None;
                 }
                 self.dispatch_current(request_id, source).await;
                 Ok(())
@@ -795,6 +999,122 @@ impl ShardEngine {
                 tracing::warn!(
                     request_id = %request_id, error = %e,
                     "D2 expert fan-out/join failed for this layer range — pipeline stalls here until a retry mechanism exists (same acceptance as this file's other stall cases)"
+                );
+                Ok(())
+            }
+        }
+    }
+
+    /// D2 multi-layer STATEFUL resume (2026-07-26 follow-up session): the
+    /// NEW-protocol counterpart of `handle_expert_group_result` above, for
+    /// an INTERIOR layer of a multi-layer range walk (`layer_idx + 1 <
+    /// layer_end` — NOT this range's last layer). Structurally almost
+    /// identical to that method (same validation, same
+    /// `ExpertDispatcher::dispatch_and_join` call, same combine), with two
+    /// deliberate differences that follow directly from the on-chain
+    /// submission-timing design decision this session made (see this
+    /// crate's D2 session report, "Choice A" — multiple internal wire
+    /// round trips per real dense shard_index, exactly ONE on-chain
+    /// submission at the end):
+    ///   1. Does NOT touch on-chain submission at all — an interior
+    ///      layer's result is never what gets submitted (only the
+    ///      boundary layer's `result.output_hash`/`result.output` is,
+    ///      exactly as before this session).
+    ///   2. Does NOT advance `pos` — this dense shard/range isn't done
+    ///      yet. Instead it feeds the combined output back to the SAME
+    ///      PINNED wallet (`pipeline.moe_layer_walk`) as the next resume
+    ///      step's input, advancing `moe_layer_walk`'s `next_layer_idx`
+    ///      by one and re-invoking `dispatch_current` (which will build
+    ///      the resume `opoi.shard_assign` — see that method's doc).
+    ///
+    /// `router_selection` is expected to have EXACTLY ONE entry (this
+    /// layer's own selection) — see `OpoiShardResult::moe_layer_step`'s doc
+    /// comment. Uses `.last()` (not `.first()`/direct indexing) purely to
+    /// keep the exact same "any layer entry, however many there happen to
+    /// be" defensive shape `handle_expert_group_result` already uses,
+    /// though in practice there is only ever the one.
+    async fn handle_moe_interior_layer_result(
+        &self,
+        request_id: &str,
+        source: &ModelSource,
+        expert_ids: Vec<u32>,
+        layer_idx: u32,
+        result: &crate::opoi::wire::OpoiShardResult,
+    ) -> Result<(), crate::error::AppError> {
+        let Some(per_layer_selections) = result.router_selection.as_ref() else {
+            tracing::warn!(
+                request_id = %request_id, shard_index = result.shard_index, layer_idx, registered_experts = expert_ids.len(),
+                "D2 multi-layer walk: this layer's result carried no router_selection — pipeline stalls here until a retry/reassignment happens."
+            );
+            return Ok(());
+        };
+        if per_layer_selections.is_empty() || per_layer_selections.iter().any(|layer_sel| layer_sel.is_empty()) {
+            tracing::error!(request_id = %request_id, layer_idx, "router_selection was present but empty (or had an empty layer entry) — dropping pipeline");
+            self.pipelines.remove(request_id);
+            return Ok(());
+        }
+        for layer_sel in per_layer_selections {
+            for sel in layer_sel {
+                if !expert_ids.contains(&sel.expert_id) {
+                    tracing::error!(
+                        request_id = %request_id, expert_id = sel.expert_id, layer_idx,
+                        "router_selection names an expert_id not registered for this layer range in the Model Execution Graph — dropping pipeline"
+                    );
+                    self.pipelines.remove(request_id);
+                    return Ok(());
+                }
+            }
+        }
+        let selections = per_layer_selections.last().expect("checked non-empty above");
+
+        let Ok(input_values) = hex_to_f32(&result.output.data_hex) else {
+            tracing::error!(request_id = %request_id, layer_idx, "shard result output data_hex failed to decode as an f32 tensor — dropping pipeline");
+            self.pipelines.remove(request_id);
+            return Ok(());
+        };
+
+        let Some((layer_start, layer_end, token_index, model_id, gguf_sha256)) = self.pipelines.get(request_id).map(|p| {
+            let shard = &p.shards[p.pos];
+            (shard.layer_start.unwrap_or(0), shard.layer_end.unwrap_or(0), p.token_index, p.manifest.model_id.clone(), p.manifest.backbone_pom_root.clone())
+        }) else {
+            return Err(crate::error::AppError::UnknownRequest);
+        };
+
+        let experts: Vec<SelectedExpert> = selections
+            .iter()
+            .map(|sel| SelectedExpert { expert_id: sel.expert_id, weight: sel.weight, shape: result.output.shape.clone(), data: input_values.clone() })
+            .collect();
+
+        let min_vram_mb = self
+            .expert_vram
+            .min_vram_mb_for_range(&model_id, &source.gguf_url, &gguf_sha256, layer_idx, layer_idx + 1, expert_ids.len() as u64)
+            .await
+            .unwrap_or(0);
+
+        let combined = self
+            .expert_dispatcher
+            .dispatch_and_join(request_id, layer_start, layer_end, layer_idx, token_index, &model_id, &source.gguf_url, &gguf_sha256, experts, move |_expert_id| min_vram_mb)
+            .await;
+
+        match combined {
+            Ok(output) => {
+                if let Some(mut pipeline) = self.pipelines.get_mut(request_id) {
+                    pipeline.current_input = ShardInputWire::Tensor { shape: output.shape, data_hex: output.data_hex };
+                    // Advance the walk to the NEXT layer, staying pinned to
+                    // the SAME wallet — see `PipelineState::moe_layer_walk`'s
+                    // doc for why this must never round-robin. `pos` is
+                    // deliberately NOT touched — this dense shard isn't done.
+                    if let Some((_, pinned_wallet)) = pipeline.moe_layer_walk.clone() {
+                        pipeline.moe_layer_walk = Some((layer_idx + 1, pinned_wallet));
+                    }
+                }
+                self.dispatch_current(request_id, source).await;
+                Ok(())
+            }
+            Err(e) => {
+                tracing::warn!(
+                    request_id = %request_id, layer_idx, error = %e,
+                    "D2 multi-layer walk: interior layer's expert fan-out/join failed — pipeline stalls here until a retry mechanism exists (same acceptance as this file's other stall cases)"
                 );
                 Ok(())
             }
@@ -1295,6 +1615,7 @@ mod tests {
             generated_token_ids: Vec::new(),
             contributions: BTreeMap::new(),
             expert_groups,
+            moe_layer_walk: None,
         }
     }
 
@@ -1436,9 +1757,10 @@ mod d2_expert_group_dispatch_tests {
                 generated_token_ids: Vec::new(),
                 contributions: std::collections::BTreeMap::new(),
                 expert_groups,
+                moe_layer_walk: None,
             },
         );
-        engine.assignments.insert("req-1".to_string(), ShardAssignment { wallet: "primary-miner".to_string(), shard_index: 0, token_index: 0 });
+        engine.assignments.insert("req-1".to_string(), ShardAssignment { wallet: "primary-miner".to_string(), shard_index: 0, token_index: 0, moe_layer_step: None });
 
         let result = OpoiShardResult {
             request_id: "req-1".to_string(),
@@ -1452,6 +1774,7 @@ mod d2_expert_group_dispatch_tests {
             // "range of length 1" degenerate case cs-miner's
             // route_only_over_range/route_only_at_layer proves agree.
             router_selection: Some(vec![vec![RouterExpertChoice { expert_id: 0, weight: 0.5 }, RouterExpertChoice { expert_id: 1, weight: 0.5 }]]),
+            moe_layer_step: None,
         };
 
         let handle = tokio::spawn({
@@ -1471,6 +1794,7 @@ mod d2_expert_group_dispatch_tests {
                 request_id: "req-1".to_string(),
                 layer_start: 0,
                 layer_end: 4,
+                layer_idx: 3, // this single-layer range's only (boundary) layer
                 expert_id,
                 token_index: 0,
                 output_hash: String::new(),
@@ -1548,9 +1872,10 @@ mod d2_expert_group_dispatch_tests {
                 generated_token_ids: Vec::new(),
                 contributions: std::collections::BTreeMap::new(),
                 expert_groups,
+                moe_layer_walk: None,
             },
         );
-        engine.assignments.insert("req-multi".to_string(), ShardAssignment { wallet: "primary-miner".to_string(), shard_index: 0, token_index: 0 });
+        engine.assignments.insert("req-multi".to_string(), ShardAssignment { wallet: "primary-miner".to_string(), shard_index: 0, token_index: 0, moe_layer_step: None });
 
         let result = OpoiShardResult {
             request_id: "req-multi".to_string(),
@@ -1569,6 +1894,7 @@ mod d2_expert_group_dispatch_tests {
                 vec![RouterExpertChoice { expert_id: 0, weight: 0.9 }, RouterExpertChoice { expert_id: 1, weight: 0.1 }],
                 vec![RouterExpertChoice { expert_id: 0, weight: 0.5 }, RouterExpertChoice { expert_id: 1, weight: 0.5 }],
             ]),
+            moe_layer_step: None,
         };
 
         let handle = tokio::spawn({
@@ -1586,6 +1912,7 @@ mod d2_expert_group_dispatch_tests {
                 request_id: "req-multi".to_string(),
                 layer_start: 0,
                 layer_end: 4,
+                layer_idx: 3, // this 2-layer range's boundary layer (the OLD path's implicit `.last()`)
                 expert_id,
                 token_index: 0,
                 output_hash: String::new(),
@@ -1647,9 +1974,10 @@ mod d2_expert_group_dispatch_tests {
                 generated_token_ids: Vec::new(),
                 contributions: std::collections::BTreeMap::new(),
                 expert_groups,
+                moe_layer_walk: None,
             },
         );
-        engine.assignments.insert("req-bad-interior".to_string(), ShardAssignment { wallet: "primary-miner".to_string(), shard_index: 0, token_index: 0 });
+        engine.assignments.insert("req-bad-interior".to_string(), ShardAssignment { wallet: "primary-miner".to_string(), shard_index: 0, token_index: 0, moe_layer_step: None });
 
         let result = OpoiShardResult {
             request_id: "req-bad-interior".to_string(),
@@ -1665,6 +1993,7 @@ mod d2_expert_group_dispatch_tests {
                 vec![RouterExpertChoice { expert_id: 99, weight: 1.0 }],
                 vec![RouterExpertChoice { expert_id: 0, weight: 0.5 }, RouterExpertChoice { expert_id: 1, weight: 0.5 }],
             ]),
+            moe_layer_step: None,
         };
 
         engine.handle_shard_result_inner("primary-miner", result).await.expect("dropping is not an error");
@@ -1703,9 +2032,10 @@ mod d2_expert_group_dispatch_tests {
                 generated_token_ids: Vec::new(),
                 contributions: std::collections::BTreeMap::new(),
                 expert_groups,
+                moe_layer_walk: None,
             },
         );
-        engine.assignments.insert("req-2".to_string(), ShardAssignment { wallet: "primary-miner".to_string(), shard_index: 0, token_index: 0 });
+        engine.assignments.insert("req-2".to_string(), ShardAssignment { wallet: "primary-miner".to_string(), shard_index: 0, token_index: 0, moe_layer_step: None });
 
         let result = OpoiShardResult {
             request_id: "req-2".to_string(),
@@ -1716,6 +2046,7 @@ mod d2_expert_group_dispatch_tests {
             next_token_id: None,
             next_token_ids: None,
             router_selection: None, // the genuine, documented gap
+            moe_layer_step: None,
         };
 
         engine.handle_shard_result_inner("primary-miner", result).await.expect("stalling is not an error");
@@ -1760,9 +2091,10 @@ mod d2_expert_group_dispatch_tests {
                 generated_token_ids: Vec::new(),
                 contributions: std::collections::BTreeMap::new(),
                 expert_groups,
+                moe_layer_walk: None,
             },
         );
-        engine.assignments.insert("req-3".to_string(), ShardAssignment { wallet: "primary-miner".to_string(), shard_index: 0, token_index: 0 });
+        engine.assignments.insert("req-3".to_string(), ShardAssignment { wallet: "primary-miner".to_string(), shard_index: 0, token_index: 0, moe_layer_step: None });
 
         let result = OpoiShardResult {
             request_id: "req-3".to_string(),
@@ -1773,6 +2105,7 @@ mod d2_expert_group_dispatch_tests {
             next_token_id: Some(42),
             next_token_ids: None,
             router_selection: None, // no expert dispatch should even be attempted here
+            moe_layer_step: None,
         };
 
         // is_last_token => true (max_tokens=1) => `finalize_pipeline` runs
@@ -1782,5 +2115,261 @@ mod d2_expert_group_dispatch_tests {
         // way the assertion below (no expert dispatch attempted, no panic)
         // holds regardless of which of those two paths this takes.
         engine.handle_shard_result_inner("primary-miner", result).await.expect("must not error");
+    }
+
+    /// D2 multi-layer STATEFUL resume (2026-07-26 follow-up session) — the
+    /// actual new end-to-end behavior this session's redesign delivers:
+    /// a genuine 2-layer range [0,4) walked ONE LAYER AT A TIME, both
+    /// layers' experts REALLY dispatched externally (not just the
+    /// boundary's), chained correctly, driven through the REAL
+    /// `dispatch_current` (not hand-constructed assignments) so the
+    /// wallet-pinning logic itself is exercised, not just
+    /// `handle_shard_result_inner`'s reaction to a result.
+    ///
+    /// Proves, in order:
+    ///  1. The FIRST dispatch for a multi-layer MoE range sets
+    ///     `moe_layer_step: Some(layer_start)` and pins the chosen wallet.
+    ///  2. The interior layer's (layer 0) real dispatch/combine does NOT
+    ///     advance `pos` and does NOT touch on-chain submission — only
+    ///     updates `current_input`/`moe_layer_walk` and re-dispatches.
+    ///  3. The RESUME dispatch for layer 1 goes back to the EXACT SAME
+    ///     wallet (never round-robins) and asks for `moe_layer_step: 1`.
+    ///  4. The boundary layer's (layer 1) combine DOES advance `pos` and
+    ///     clears `moe_layer_walk`, using the BOUNDARY's own combined
+    ///     weights (deliberately different from the interior layer's, so a
+    ///     bug that confused the two would be caught).
+    ///  5. The NEXT dense shard (no expert group) is dispatched normally,
+    ///     round-robining away from the pinned wallet — proving the pin
+    ///     doesn't leak into unrelated shards.
+    #[tokio::test]
+    async fn moe_multi_layer_stateful_walk_dispatches_every_layer_pinned_to_the_same_wallet() {
+        let registry = Arc::new(MinerRegistry::new());
+
+        // Registration order matters for `pick_next`'s round-robin:
+        // "primary-miner" first (picked for shard 0's fresh dispatch, with
+        // `last_assigned` starting `None`), then "next-hop-miner" (picked
+        // next, for shard 1, once `last_assigned` has advanced past
+        // "primary-miner").
+        let (tx_primary, mut rx_primary) = tokio::sync::mpsc::unbounded_channel();
+        registry.register("primary-miner".to_string(), tx_primary);
+        let (tx_next, mut rx_next) = tokio::sync::mpsc::unbounded_channel();
+        registry.register("next-hop-miner".to_string(), tx_next);
+        let (tx_a, mut rx_a) = tokio::sync::mpsc::unbounded_channel();
+        let (tx_b, mut rx_b) = tokio::sync::mpsc::unbounded_channel();
+        registry.register("expert-a".to_string(), tx_a);
+        registry.register("expert-b".to_string(), tx_b);
+        registry.mark_expert_capable("expert-a", 24_000);
+        registry.mark_expert_capable("expert-b", 24_000);
+
+        let expert_dispatcher = Arc::new(ExpertDispatcher::new(registry.clone()));
+        let engine = Arc::new(test_engine(registry.clone(), "model-x", expert_dispatcher.clone()));
+
+        // A genuine 2-LAYER range [0,2) — layer 0 is the interior layer,
+        // layer 1 is the boundary. (Earlier D2 tests in this module use
+        // [0,4) but only ever dispatch ITS boundary layer 3 in one shot;
+        // here we need EXACTLY two absolute layers, 0 and 1, to walk.)
+        let mut expert_groups = HashMap::new();
+        expert_groups.insert((0u32, 2u32), vec![0u32, 1u32]);
+
+        engine.pipelines.insert(
+            "req-walk".to_string(),
+            PipelineState {
+                shards: vec![dense(0, 0, 2), dense(1, 2, 8)],
+                manifest: test_manifest("model-x"),
+                prompt_hash: "ph".to_string(),
+                max_tokens: 4,
+                pos: 0,
+                token_index: 0,
+                current_input: ShardInputWire::Prompt { prompt_hex: "aa".to_string() },
+                original_prompt_hex: "aa".to_string(),
+                generated_token_ids: Vec::new(),
+                contributions: std::collections::BTreeMap::new(),
+                expert_groups,
+                moe_layer_walk: None,
+            },
+        );
+
+        let source = ModelSource {
+            gguf_url: "http://gguf.example/model.gguf".to_string(),
+            tokenizer_url: "http://gguf.example/tok".to_string(),
+            tokenizer_sha256: "tok-hash".to_string(),
+        };
+
+        // ---- Step 1: fresh dispatch for shard 0 (2-layer range [0,4)) -------
+        engine.dispatch_current("req-walk", &source).await;
+        let assign_line_1 = rx_primary.recv().await.expect("primary-miner got the fresh dispatch");
+        assert!(assign_line_1.contains(r#""moe_layer_step":0"#), "fresh dispatch should ask for layer_idx=layer_start=0: {assign_line_1}");
+
+        {
+            let pipeline = engine.pipelines.get("req-walk").unwrap();
+            assert_eq!(pipeline.moe_layer_walk, Some((0, "primary-miner".to_string())));
+        }
+
+        // ---- Miner replies with layer 0's (INTERIOR) real selection ---------
+        let result1 = OpoiShardResult {
+            request_id: "req-walk".to_string(),
+            shard_index: 0,
+            token_index: 0,
+            output_hash: "irrelevant-for-this-test".to_string(),
+            output: ShardOutputWire { shape: vec![2], data_hex: f32_to_hex(&[1.0, 2.0]) },
+            next_token_id: None,
+            next_token_ids: None,
+            router_selection: Some(vec![vec![RouterExpertChoice { expert_id: 0, weight: 0.9 }, RouterExpertChoice { expert_id: 1, weight: 0.1 }]]),
+            moe_layer_step: Some(0),
+        };
+        let handle1 = tokio::spawn({
+            let engine = engine.clone();
+            async move { engine.handle_shard_result_inner("primary-miner", result1).await }
+        });
+        let line_a1 = rx_a.recv().await.expect("expert-a got a line for layer 0");
+        let line_b1 = rx_b.recv().await.expect("expert-b got a line for layer 0");
+        assert!(line_a1.contains("opoi.expert_assign"));
+        assert!(line_b1.contains("opoi.expert_assign"));
+        for (expert_id, wallet, value) in [(0u32, "expert-a", 10.0f32), (1u32, "expert-b", 20.0f32)] {
+            let reply = OpoiExpertResult {
+                request_id: "req-walk".to_string(),
+                layer_start: 0,
+                layer_end: 2,
+                layer_idx: 0,
+                expert_id,
+                token_index: 0,
+                output_hash: String::new(),
+                output: ExpertOutputWire { shape: vec![2], data_hex: f32_to_hex(&[value, value]) },
+            };
+            expert_dispatcher.handle_expert_result(wallet, reply).await.expect("reply accepted");
+        }
+        handle1.await.expect("task join").expect("handle_shard_result_inner ok (interior)");
+
+        // Interior layer must NOT advance pos, NOT clear the pin, and must
+        // feed the REAL combined output (0.9*10 + 0.1*20 = 11.0) forward as
+        // the resume step's input.
+        {
+            let pipeline = engine.pipelines.get("req-walk").unwrap();
+            assert_eq!(pipeline.pos, 0, "interior layer must not advance pos");
+            assert_eq!(pipeline.moe_layer_walk, Some((1, "primary-miner".to_string())), "walk must advance to layer 1, still pinned to primary-miner");
+            match &pipeline.current_input {
+                ShardInputWire::Tensor { data_hex, .. } => {
+                    let vals = hex_to_f32(data_hex).unwrap();
+                    assert!((vals[0] - 11.0).abs() < 1e-5, "expected interior combine 0.9*10+0.1*20=11.0, got {vals:?}");
+                }
+                other => panic!("expected Tensor input after interior combine, got {other:?}"),
+            }
+        }
+
+        // ---- The RESUME dispatch for layer 1 must go back to the SAME wallet
+        let assign_line_2 = rx_primary.recv().await.expect("primary-miner (same wallet) got the resume dispatch too");
+        assert!(assign_line_2.contains(r#""moe_layer_step":1"#), "resume dispatch should ask for layer_idx=1: {assign_line_2}");
+
+        // ---- Miner replies with layer 1's (BOUNDARY) real selection ---------
+        let result2 = OpoiShardResult {
+            request_id: "req-walk".to_string(),
+            shard_index: 0,
+            token_index: 0,
+            output_hash: "boundary-hash".to_string(),
+            output: ShardOutputWire { shape: vec![2], data_hex: f32_to_hex(&[3.0, 4.0]) },
+            next_token_id: None,
+            next_token_ids: None,
+            router_selection: Some(vec![vec![RouterExpertChoice { expert_id: 0, weight: 0.5 }, RouterExpertChoice { expert_id: 1, weight: 0.5 }]]),
+            moe_layer_step: Some(1),
+        };
+        let handle2 = tokio::spawn({
+            let engine = engine.clone();
+            async move { engine.handle_shard_result_inner("primary-miner", result2).await }
+        });
+        let line_a2 = rx_a.recv().await.expect("expert-a got a line for layer 1 (boundary)");
+        let line_b2 = rx_b.recv().await.expect("expert-b got a line for layer 1 (boundary)");
+        assert!(line_a2.contains("opoi.expert_assign"));
+        assert!(line_b2.contains("opoi.expert_assign"));
+        for (expert_id, wallet, value) in [(0u32, "expert-a", 100.0f32), (1u32, "expert-b", 200.0f32)] {
+            let reply = OpoiExpertResult {
+                request_id: "req-walk".to_string(),
+                layer_start: 0,
+                layer_end: 2,
+                layer_idx: 1,
+                expert_id,
+                token_index: 0,
+                output_hash: String::new(),
+                output: ExpertOutputWire { shape: vec![2], data_hex: f32_to_hex(&[value, value]) },
+            };
+            expert_dispatcher.handle_expert_result(wallet, reply).await.expect("reply accepted");
+        }
+        handle2.await.expect("task join").expect("handle_shard_result_inner ok (boundary)");
+
+        // Boundary layer MUST advance pos and clear the pin, using the
+        // BOUNDARY's own combined weights (0.5*100 + 0.5*200 = 150.0) — NOT
+        // the interior layer's 11.0, proving the two steps' data never
+        // cross-contaminate.
+        {
+            let pipeline = engine.pipelines.get("req-walk").expect("pipeline still in flight (not the last shard)");
+            assert_eq!(pipeline.pos, 1);
+            assert_eq!(pipeline.moe_layer_walk, None, "walk must be cleared once the boundary layer completes");
+            match &pipeline.current_input {
+                ShardInputWire::Tensor { data_hex, .. } => {
+                    let vals = hex_to_f32(data_hex).unwrap();
+                    assert!((vals[0] - 150.0).abs() < 1e-5, "expected boundary combine 0.5*100+0.5*200=150.0, got {vals:?}");
+                }
+                other => panic!("expected Tensor input after boundary combine, got {other:?}"),
+            }
+        }
+
+        // Next dense shard (shard 1, no expert group) dispatched normally —
+        // round-robins AWAY from the pinned wallet, plain (no
+        // moe_layer_step), proving the pin never leaks into an unrelated
+        // shard.
+        let next_line = rx_next.recv().await.expect("next-hop-miner got the next dense-shard assignment");
+        assert!(next_line.contains("opoi.shard_assign"));
+        assert!(!next_line.contains("moe_layer_step"));
+    }
+
+    /// D2 multi-layer STATEFUL resume: if the wallet pinned mid-walk
+    /// disconnects, that range-walk's residual/KV state is gone for good
+    /// (it only ever existed on that one machine — see
+    /// `PipelineState::moe_layer_walk`'s doc) — `dispatch_current` must
+    /// drop the whole pipeline rather than silently resuming against some
+    /// OTHER connected miner, which would compute a wrong result (a fresh
+    /// miner has no residual to finish the interior layer's combine with).
+    #[tokio::test]
+    async fn dispatch_current_drops_pipeline_when_pinned_wallet_for_a_mid_walk_resume_is_gone() {
+        let registry = Arc::new(MinerRegistry::new());
+        // "ghost-miner" (the pinned wallet) is deliberately NEVER registered
+        // — simulates it having already disconnected.
+
+        let expert_dispatcher = Arc::new(ExpertDispatcher::new(registry.clone()));
+        let engine = Arc::new(test_engine(registry.clone(), "model-x", expert_dispatcher));
+
+        let mut expert_groups = HashMap::new();
+        expert_groups.insert((0u32, 2u32), vec![0u32, 1u32]);
+
+        engine.pipelines.insert(
+            "req-disc".to_string(),
+            PipelineState {
+                shards: vec![dense(0, 0, 2), dense(1, 2, 8)],
+                manifest: test_manifest("model-x"),
+                prompt_hash: "ph".to_string(),
+                max_tokens: 4,
+                pos: 0,
+                token_index: 0,
+                current_input: ShardInputWire::Tensor { shape: vec![2], data_hex: f32_to_hex(&[1.0, 2.0]) },
+                original_prompt_hex: "aa".to_string(),
+                generated_token_ids: Vec::new(),
+                contributions: std::collections::BTreeMap::new(),
+                expert_groups,
+                // Mid-walk state: pinned to a wallet that is NOT connected.
+                moe_layer_walk: Some((1, "ghost-miner".to_string())),
+            },
+        );
+
+        let source = ModelSource {
+            gguf_url: "http://gguf.example/model.gguf".to_string(),
+            tokenizer_url: "http://gguf.example/tok".to_string(),
+            tokenizer_sha256: "tok-hash".to_string(),
+        };
+
+        engine.dispatch_current("req-disc", &source).await;
+
+        assert!(
+            engine.pipelines.get("req-disc").is_none(),
+            "pipeline must be dropped when the pinned wallet is gone, not silently resumed against a different miner"
+        );
     }
 }

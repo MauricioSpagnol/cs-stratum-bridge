@@ -431,6 +431,12 @@ impl SpeculativeEngine {
             model_gguf_sha256: backbone_pom_root,
             model_tokenizer_url: (is_entry && is_prompt_processing).then_some(tokenizer_url),
             model_tokenizer_sha256: (is_entry && is_prompt_processing).then_some(tokenizer_sha256),
+            // D2 multi-layer STATEFUL resume is not wired into the
+            // speculative-decoding pipeline (a separate, independent engine
+            // — see this file's module doc) — out of scope for this
+            // session, same as the plain B1 dense path already was before
+            // this field existed.
+            moe_layer_step: None,
         };
         self.shard_assignments.insert(request_id.to_string(), ShardStepAssignment { wallet: wallet.clone(), shard_index: shard.shard_index });
         let _ = tx.send(build_shard_assign_line(&assign));

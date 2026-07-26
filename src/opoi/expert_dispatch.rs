@@ -72,6 +72,16 @@ pub struct ExpertAssignmentKey {
     pub request_id: String,
     pub layer_start: u32,
     pub layer_end: u32,
+    /// D2 multi-layer follow-up (2026-07-26): the ABSOLUTE layer index
+    /// this dispatch's `expert_id` FFN runs at — added so two DIFFERENT
+    /// layers' fan-outs within the SAME `(layer_start, layer_end)` range
+    /// (now genuinely possible once every layer in a range is walked and
+    /// dispatched individually, not just the range's last one) never
+    /// collide in `assignments`/`pending`. For the pre-existing
+    /// single-layer-range case this is always `layer_start` (or
+    /// equivalently `layer_end - 1`) — behavior for that case is
+    /// unchanged.
+    pub layer_idx: u32,
     pub expert_id: u32,
 }
 
@@ -153,11 +163,13 @@ impl ExpertDispatcher {
     /// host it — see `MinerRegistry::pick_expert_hosts_top_n`'s TODO on why
     /// that number isn't computed inside this module (GGUF/manifest expert
     /// size metadata isn't threaded through to this layer yet).
+    #[allow(clippy::too_many_arguments)]
     pub async fn dispatch_and_join(
         &self,
         request_id: &str,
         layer_start: u32,
         layer_end: u32,
+        layer_idx: u32,
         token_index: u32,
         model_id: &str,
         model_gguf_url: &str,
@@ -168,6 +180,9 @@ impl ExpertDispatcher {
         if experts.is_empty() {
             return Err("dispatch_and_join called with an empty expert list".to_string());
         }
+        if layer_idx < layer_start || layer_idx >= layer_end {
+            return Err(format!("dispatch_and_join called with layer_idx={layer_idx} outside its own range [{layer_start},{layer_end})"));
+        }
 
         // Up-front, sequential host selection (see doc comment above).
         let mut used_wallets: Vec<String> = Vec::new();
@@ -176,7 +191,7 @@ impl ExpertDispatcher {
             let min_vram = min_vram_mb_for(sel.expert_id);
             let Some(wallet) = self.registry.pick_expert_host(min_vram, &used_wallets) else {
                 return Err(format!(
-                    "no eligible expert host for expert_id={} (min_vram_mb={min_vram}) at layer [{layer_start},{layer_end}) — abandoning whole fan-out group",
+                    "no eligible expert host for expert_id={} (min_vram_mb={min_vram}) at layer {layer_idx} (range [{layer_start},{layer_end})) — abandoning whole fan-out group",
                     sel.expert_id
                 ));
             };
@@ -185,7 +200,9 @@ impl ExpertDispatcher {
         }
 
         let dispatches = planned.into_iter().map(|(sel, wallet)| {
-            self.dispatch_one_with_retry(request_id, layer_start, layer_end, token_index, model_id, model_gguf_url, model_gguf_sha256, sel, wallet, used_wallets.clone())
+            self.dispatch_one_with_retry(
+                request_id, layer_start, layer_end, layer_idx, token_index, model_id, model_gguf_url, model_gguf_sha256, sel, wallet, used_wallets.clone(),
+            )
         });
 
         let outcomes: Vec<ExpertOutcome> = futures::future::join_all(dispatches).await;
@@ -213,6 +230,7 @@ impl ExpertDispatcher {
         request_id: &str,
         layer_start: u32,
         layer_end: u32,
+        layer_idx: u32,
         token_index: u32,
         model_id: &str,
         model_gguf_url: &str,
@@ -226,7 +244,7 @@ impl ExpertDispatcher {
 
         loop {
             match self
-                .dispatch_one(request_id, layer_start, layer_end, token_index, model_id, model_gguf_url, model_gguf_sha256, &sel, &wallet)
+                .dispatch_one(request_id, layer_start, layer_end, layer_idx, token_index, model_id, model_gguf_url, model_gguf_sha256, &sel, &wallet)
                 .await
             {
                 Ok(result) => return Ok((sel.weight, result)),
@@ -269,6 +287,7 @@ impl ExpertDispatcher {
         request_id: &str,
         layer_start: u32,
         layer_end: u32,
+        layer_idx: u32,
         token_index: u32,
         model_id: &str,
         model_gguf_url: &str,
@@ -276,7 +295,7 @@ impl ExpertDispatcher {
         sel: &SelectedExpert,
         wallet: &str,
     ) -> Result<OpoiExpertResult, String> {
-        let key = ExpertAssignmentKey { request_id: request_id.to_string(), layer_start, layer_end, expert_id: sel.expert_id };
+        let key = ExpertAssignmentKey { request_id: request_id.to_string(), layer_start, layer_end, layer_idx, expert_id: sel.expert_id };
 
         let tx = self.registry.get(wallet).ok_or_else(|| format!("wallet {wallet} not connected"))?;
 
@@ -288,6 +307,7 @@ impl ExpertDispatcher {
             model_id: model_id.to_string(),
             layer_start,
             layer_end,
+            layer_idx,
             expert_id: sel.expert_id,
             token_index,
             input: ExpertInputWire::Tensor { shape: sel.shape.clone(), data_hex },
@@ -331,6 +351,7 @@ impl crate::opoi::handler::ExpertHandler for ExpertDispatcher {
             request_id: result.request_id.clone(),
             layer_start: result.layer_start,
             layer_end: result.layer_end,
+            layer_idx: result.layer_idx,
             expert_id: result.expert_id,
         };
 
@@ -445,6 +466,7 @@ mod combine_tests {
             request_id: "req-1".into(),
             layer_start: 0,
             layer_end: 4,
+            layer_idx: 3,
             expert_id,
             token_index: 0,
             output_hash: String::new(),
@@ -535,7 +557,7 @@ mod dispatch_tests {
         let d = dispatcher.clone();
         let handle = tokio::spawn(async move {
             d.dispatch_and_join(
-                "req-1", 0, 4, 0, "model-x", "http://gguf", "gguf-hash",
+                "req-1", 0, 4, 3, 0, "model-x", "http://gguf", "gguf-hash",
                 vec![expert(0, 0.5, 10.0), expert(1, 0.5, 20.0)],
                 |_expert_id| 1_000,
             )
@@ -557,6 +579,7 @@ mod dispatch_tests {
                 request_id: "req-1".into(),
                 layer_start: 0,
                 layer_end: 4,
+                layer_idx: 3,
                 expert_id,
                 token_index: 0,
                 output_hash: String::new(),
@@ -582,7 +605,7 @@ mod dispatch_tests {
         // the second can never be dispatched, so the whole group must fail
         // fast without ever sending a line for the first.
         let result = dispatcher
-            .dispatch_and_join("req-2", 0, 4, 0, "model-x", "http://gguf", "gguf-hash", vec![expert(0, 0.5, 1.0), expert(1, 0.5, 2.0)], |_| 1_000)
+            .dispatch_and_join("req-2", 0, 4, 3, 0, "model-x", "http://gguf", "gguf-hash", vec![expert(0, 0.5, 1.0), expert(1, 0.5, 2.0)], |_| 1_000)
             .await;
         assert!(result.is_err());
     }
@@ -591,7 +614,17 @@ mod dispatch_tests {
     async fn dispatch_and_join_rejects_empty_expert_list() {
         let registry = Arc::new(MinerRegistry::new());
         let dispatcher = ExpertDispatcher::new(registry);
-        let result = dispatcher.dispatch_and_join("req-3", 0, 4, 0, "model-x", "http://gguf", "gguf-hash", vec![], |_| 1_000).await;
+        let result = dispatcher.dispatch_and_join("req-3", 0, 4, 3, 0, "model-x", "http://gguf", "gguf-hash", vec![], |_| 1_000).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn dispatch_and_join_rejects_layer_idx_outside_its_own_range() {
+        let registry = Arc::new(MinerRegistry::new());
+        let dispatcher = ExpertDispatcher::new(registry);
+        // layer_idx=4 is NOT inside [0,4) — must be rejected up front,
+        // before ever attempting to pick a host or dispatch anything.
+        let result = dispatcher.dispatch_and_join("req-3b", 0, 4, 4, 0, "model-x", "http://gguf", "gguf-hash", vec![expert(0, 1.0, 1.0)], |_| 1_000).await;
         assert!(result.is_err());
     }
 
@@ -601,12 +634,12 @@ mod dispatch_tests {
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         registry.register("trusted-wallet".to_string(), tx);
         let dispatcher = ExpertDispatcher::new(registry);
-        let key = ExpertAssignmentKey { request_id: "req-1".into(), layer_start: 0, layer_end: 4, expert_id: 0 };
+        let key = ExpertAssignmentKey { request_id: "req-1".into(), layer_start: 0, layer_end: 4, layer_idx: 3, expert_id: 0 };
         dispatcher.assignments.insert(key.clone(), "trusted-wallet".to_string());
         dispatcher.pending.insert(key, oneshot::channel().0);
 
         let result = OpoiExpertResult {
-            request_id: "req-1".into(), layer_start: 0, layer_end: 4, expert_id: 0, token_index: 0,
+            request_id: "req-1".into(), layer_start: 0, layer_end: 4, layer_idx: 3, expert_id: 0, token_index: 0,
             output_hash: String::new(), output: ExpertOutputWire { shape: vec![1], data_hex: f32_to_hex(&[1.0]) },
         };
         let outcome = dispatcher.handle_expert_result("some-other-wallet", result).await;
@@ -618,7 +651,7 @@ mod dispatch_tests {
         let registry = Arc::new(MinerRegistry::new());
         let dispatcher = ExpertDispatcher::new(registry);
         let result = OpoiExpertResult {
-            request_id: "never-dispatched".into(), layer_start: 0, layer_end: 4, expert_id: 0, token_index: 0,
+            request_id: "never-dispatched".into(), layer_start: 0, layer_end: 4, layer_idx: 3, expert_id: 0, token_index: 0,
             output_hash: String::new(), output: ExpertOutputWire { shape: vec![1], data_hex: f32_to_hex(&[1.0]) },
         };
         let outcome = dispatcher.handle_expert_result("any-wallet", result).await;
@@ -632,7 +665,7 @@ mod dispatch_tests {
         registry.register("trusted-wallet".to_string(), tx);
         let dispatcher = ExpertDispatcher::new(registry);
 
-        let key = ExpertAssignmentKey { request_id: "req-1".into(), layer_start: 0, layer_end: 4, expert_id: 0 };
+        let key = ExpertAssignmentKey { request_id: "req-1".into(), layer_start: 0, layer_end: 4, layer_idx: 3, expert_id: 0 };
         let (result_tx, result_rx) = oneshot::channel::<OpoiExpertResult>();
         dispatcher.assignments.insert(key.clone(), "trusted-wallet".to_string());
         dispatcher.pending.insert(key.clone(), result_tx);
@@ -645,15 +678,26 @@ mod dispatch_tests {
 
     #[test]
     fn expert_assignment_key_distinguishes_different_experts_same_request() {
-        let a = ExpertAssignmentKey { request_id: "r".into(), layer_start: 0, layer_end: 4, expert_id: 0 };
-        let b = ExpertAssignmentKey { request_id: "r".into(), layer_start: 0, layer_end: 4, expert_id: 1 };
+        let a = ExpertAssignmentKey { request_id: "r".into(), layer_start: 0, layer_end: 4, layer_idx: 3, expert_id: 0 };
+        let b = ExpertAssignmentKey { request_id: "r".into(), layer_start: 0, layer_end: 4, layer_idx: 3, expert_id: 1 };
         assert_ne!(a, b);
     }
 
     #[test]
     fn expert_assignment_key_distinguishes_different_layer_ranges_same_expert() {
-        let a = ExpertAssignmentKey { request_id: "r".into(), layer_start: 0, layer_end: 4, expert_id: 0 };
-        let b = ExpertAssignmentKey { request_id: "r".into(), layer_start: 4, layer_end: 8, expert_id: 0 };
+        let a = ExpertAssignmentKey { request_id: "r".into(), layer_start: 0, layer_end: 4, layer_idx: 3, expert_id: 0 };
+        let b = ExpertAssignmentKey { request_id: "r".into(), layer_start: 4, layer_end: 8, layer_idx: 7, expert_id: 0 };
+        assert_ne!(a, b);
+    }
+
+    /// D2 multi-layer follow-up (2026-07-26): the exact collision this
+    /// field was added to prevent — two DIFFERENT absolute layers within
+    /// the SAME `(layer_start, layer_end)` range, same expert_id, must be
+    /// distinguishable.
+    #[test]
+    fn expert_assignment_key_distinguishes_different_layer_idx_same_range_and_expert() {
+        let a = ExpertAssignmentKey { request_id: "r".into(), layer_start: 0, layer_end: 4, layer_idx: 1, expert_id: 0 };
+        let b = ExpertAssignmentKey { request_id: "r".into(), layer_start: 0, layer_end: 4, layer_idx: 2, expert_id: 0 };
         assert_ne!(a, b);
     }
 }
