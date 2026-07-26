@@ -235,12 +235,58 @@ impl CsdRpcClient {
     /// this fork — not OPoI-specific and not verified against this project's
     /// actual RPC allowlist in this session; confirm it's enabled/registered
     /// before relying on it in production.
+    ///
+    /// Amounts are formatted as fixed 8-decimal-place strings rather than
+    /// passed through as raw JSON numbers: summing rewards in `f64` easily
+    /// produces values like `3.0191999999999997` (`1.0064 * 3`) that have no
+    /// exact decimal representation, and serde_json's shortest-round-trip
+    /// serializer emits every one of those digits. The daemon's
+    /// `ParseFixedPoint(str, 8, ...)` rejects anything past 8 decimal places
+    /// with `RPC_TYPE_ERROR`/"Invalid amount" — confirmed live against a real
+    /// payout tick. `AmountFromValue` on the daemon side accepts string
+    /// amounts too, so formatting here sidesteps the float round-trip
+    /// entirely instead of trying to pick a "safe" rounding of the f64.
     pub async fn send_many(
         &self,
         from_account_or_empty: &str,
         amounts: &BTreeMap<String, f64>,
     ) -> Result<String, AppError> {
-        let params = serde_json::json!([from_account_or_empty, amounts]);
+        let params = serde_json::json!([from_account_or_empty, format_amounts(amounts)]);
         self.call("sendmany", params).await
+    }
+}
+
+/// Renders each amount as a fixed 8-decimal-place string — see `send_many`'s
+/// doc comment for why raw `f64` JSON serialization isn't safe here.
+fn format_amounts(amounts: &BTreeMap<String, f64>) -> BTreeMap<String, String> {
+    amounts.iter().map(|(wallet, amount)| (wallet.clone(), format!("{:.8}", amount))).collect()
+}
+
+#[cfg(test)]
+mod format_amounts_tests {
+    use super::*;
+
+    #[test]
+    fn renders_lossy_float_sums_within_the_daemons_8_decimal_limit() {
+        let mut amounts = BTreeMap::new();
+        // 1.0064 * 3 in real f64 arithmetic — the exact value that triggered
+        // a live `sendmany` "Invalid amount" failure before this fix.
+        amounts.insert("tmAVMxFD4vAvu16Pefa2X66zixCWrYFpcUf".to_string(), 1.0064_f64 * 3.0);
+
+        let formatted = format_amounts(&amounts);
+
+        let rendered = &formatted["tmAVMxFD4vAvu16Pefa2X66zixCWrYFpcUf"];
+        assert_eq!(rendered, "3.01920000");
+        assert!(rendered.split('.').nth(1).unwrap().len() <= 8);
+    }
+
+    #[test]
+    fn preserves_clean_values() {
+        let mut amounts = BTreeMap::new();
+        amounts.insert("wallet-a".to_string(), 5.5_f64);
+
+        let formatted = format_amounts(&amounts);
+
+        assert_eq!(formatted["wallet-a"], "5.50000000");
     }
 }
