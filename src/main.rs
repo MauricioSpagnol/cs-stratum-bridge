@@ -71,9 +71,16 @@ async fn main() -> anyhow::Result<()> {
     if b3lite_cfg.is_none() {
         tracing::info!("B3LITE_RECEIPT_SECRET not set — B3-lite receipts/sampling/audit disabled");
     }
+    // D2 (2026-07-26 session): constructed here (moved up from where it used
+    // to live, right before the proxy wiring at the bottom of this
+    // function) because `ShardEngine` now needs the SAME instance to fan
+    // out an EXPERT-graph layer range via `dispatch_and_join` — see
+    // `shard_engine.rs`'s module doc. Still also handed to the proxy below
+    // as the process's `Arc<dyn ExpertHandler>`, unchanged.
+    let expert_dispatcher = Arc::new(ExpertDispatcher::new(registry.clone()));
     let shard_engine = Arc::new(ShardEngine::new(
         csd.clone(), db_pool.clone(), registry.clone(), stake_pool.clone(), ModelSourceConfig::from_env(), Some(speculative_engine.clone()),
-        b3lite_cfg.clone(),
+        b3lite_cfg.clone(), expert_dispatcher.clone(),
     ));
 
     engine
@@ -223,17 +230,6 @@ async fn main() -> anyhow::Result<()> {
             tracing::error!(error = %e, "HTTP server error");
         }
     });
-
-    // D2 (2026-07-26 session): constructed unconditionally, same reasoning
-    // as `speculative_engine`/`b3lite_auditor` above — with no MoE model's
-    // Model Execution Graph ever reaching this dispatcher yet (ShardEngine
-    // still skips any `EXPERT`-bearing graph entirely, see
-    // `shard_engine.rs`'s module doc), `ExpertDispatcher` simply never gets
-    // a `dispatch_and_join` call in practice today. It still needs to exist
-    // here so the proxy's session-level wiring always has a real
-    // `Arc<dyn ExpertHandler>` to hand a stray/late `opoi.expert_result`
-    // to (rejected as `UnknownRequest`, same as any other unmatched reply).
-    let expert_dispatcher = Arc::new(ExpertDispatcher::new(registry.clone()));
 
     let handler: Arc<dyn OpoiHandler> = engine.clone();
     let shard_handler: Arc<dyn ShardHandler> = shard_engine.clone();

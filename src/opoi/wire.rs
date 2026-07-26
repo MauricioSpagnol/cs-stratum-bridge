@@ -135,6 +135,38 @@ pub struct OpoiShardResult {
     /// instead of learning only the very last position.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub next_token_ids: Option<Vec<u32>>,
+    /// D2 (2026-07-26, distributed per-expert MoE dispatch): which experts
+    /// the PRIMARY miner's real router actually selected for this shard's
+    /// layer range, with the router's combine weight for each — meaningful
+    /// ONLY when this shard's `(layer_start, layer_end)` range has one or
+    /// more `EXPERT` nodes registered in the Model Execution Graph (see
+    /// `shard_engine.rs`'s `PipelineState::expert_groups`).
+    ///
+    /// TODO(D2-ROUTER-SELECTION): this field is the seam meant to carry
+    /// that choice back to this bridge — added here additively
+    /// (`#[serde(default)]`, so any cs-miner build that never sets it still
+    /// deserializes fine as `None`) — but as of this writing NO shipped
+    /// cs-miner build actually populates it. Doing so would require
+    /// cs-miner's dense-shard compute to run router-only (attention +
+    /// router logits, NOT the full FFN) for an EXPERT-graph layer range,
+    /// which isn't implemented there today (a separate, cs-miner-side piece
+    /// of D2 work, out of scope for this change). Until then,
+    /// `shard_engine.rs::ShardEngine::handle_expert_group_result` logs a
+    /// clear warning and stalls the pipeline whenever this is `None` for a
+    /// shard whose range has a registered EXPERT group — it never
+    /// fabricates a selection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub router_selection: Option<Vec<RouterExpertChoice>>,
+}
+
+/// One expert the primary router selected for a `(layer_start, layer_end)`
+/// range, with the combine weight it assigned — see
+/// `OpoiShardResult::router_selection`'s doc comment. Not yet emitted by any
+/// shipped cs-miner build (TODO(D2-ROUTER-SELECTION)).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RouterExpertChoice {
+    pub expert_id: u32,
+    pub weight: f32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

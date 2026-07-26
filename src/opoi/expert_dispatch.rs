@@ -383,8 +383,12 @@ fn f32_to_hex(data: &[f32]) -> String {
 
 /// Reverses `f32_to_hex`'s encoding — same 4-byte little-endian layout
 /// cs-miner's own `TensorPayload::from_hex` uses (`shard_compute.rs`), so a
-/// real miner's `opoi.expert_result` decodes correctly here.
-fn hex_to_f32(hex_str: &str) -> Result<Vec<f32>, String> {
+/// real miner's `opoi.expert_result` decodes correctly here. `pub(crate)`
+/// (not private): `shard_engine.rs`'s D2 integration
+/// (`handle_expert_group_result`) reuses this exact decode to turn a dense
+/// shard's `ShardOutputWire::data_hex` into the `Vec<f32>` activation every
+/// selected expert in a fan-out group is dispatched with as input.
+pub(crate) fn hex_to_f32(hex_str: &str) -> Result<Vec<f32>, String> {
     let bytes = hex::decode(hex_str).map_err(|e| format!("output data_hex was not valid hex: {e}"))?;
     if bytes.len() % 4 != 0 {
         return Err(format!("output data_hex length {} is not a multiple of 4", bytes.len()));

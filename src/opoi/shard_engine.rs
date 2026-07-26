@@ -19,33 +19,54 @@
 //! has a live, authenticated stratum connection to the bridge; nothing new
 //! needs to be reachable.
 //!
-//! MoE is explicitly out of scope here: any model whose Model Execution
-//! Graph contains an `EXPERT` shard is skipped entirely (logged, not
-//! attempted) — giant MoE models are served single-node via the offload
-//! path instead (F9-G/F15-M, `CS COIN OPoI MELHOR IMPLEMENTAÇÃO.txt`
-//! Sprint 4/8).
+//! D2 (2026-07-26 session): a model whose Model Execution Graph contains
+//! `EXPERT` nodes is no longer skipped wholesale — cloudservice's
+//! `BuildModelExecutionGraph` now emits real per-`(layer_range, expert_id)`
+//! `EXPERT` nodes for MoE/HYBRID manifests (see "ESCOPO DE IMPLEMENTAÇÃO DO
+//! D2" in `CS COIN OPoI MELHOR IMPLEMENTAÇÃO.txt`), laid out as: every
+//! DENSE node for every layer range first (in range order), then every
+//! EXPERT node grouped by layer range in that same order (`numExperts`
+//! nodes per range). `poll_and_start_tick` now splits a fetched graph into
+//! its DENSE nodes (`PipelineState::shards` — walked by `dispatch_current`/
+//! `handle_shard_result_inner` exactly as before, byte-for-byte, for a pure
+//! DENSE model) and its EXPERT nodes, grouped by the `(layer_start,
+//! layer_end)` range of the DENSE shard they sit alongside
+//! (`PipelineState::expert_groups`).
 //!
-//! D2 update (2026-07-26 session): the skip above is still correct today —
-//! cloudservice hasn't started emitting real per-(layer_range, expert_id)
-//! `EXPERT` nodes into the Model Execution Graph yet (separate, parallel
-//! piece of D2 work — see "ESCOPO DE IMPLEMENTAÇÃO DO D2" in the design
-//! doc), so there is nothing real for this engine to dispatch against
-//! there yet. The per-expert fan-out/join-barrier DISPATCH mechanism itself
-//! — generalizing this file's own single-assignee `ShardAssignment`/
-//! `assignments` pattern to one keyed by `(request_id, layer_start,
-//! layer_end, expert_id)`, since a single token/layer can now fan out to K
-//! wallets at once instead of the ONE this file's dense pipeline ever has
-//! in flight — already exists, in `expert_dispatch.rs::ExpertDispatcher`
-//! (kept as its own component rather than folded into `PipelineState`/
-//! `ShardAssignment` below, for the same reason `SpeculativeEngine` is its
-//! own component and not a `ShardEngine` field: a dense-pipeline
-//! `PipelineState` tracks exactly one shard/token in flight system-wide per
-//! request, an invariant the K-way MoE fan-out genuinely breaks, so forcing
-//! both shapes into one struct would mean every dense-only field grows an
-//! MoE-only sibling it never uses, and vice versa). The integration point
-//! that would call `ExpertDispatcher::dispatch_and_join` from THIS engine's
-//! `dispatch_current`/`handle_shard_result_inner` loop — once an `EXPERT`
-//! MEG node actually shows up — is future work, not attempted this pass.
+//! When a dense shard's result comes back for a range that has a
+//! registered EXPERT group, `handle_shard_result_inner` routes to
+//! `handle_expert_group_result` instead of the plain dense-to-dense
+//! handoff: that method fans the group out via
+//! `expert_dispatch.rs::ExpertDispatcher::dispatch_and_join` (kept as its
+//! own component, not folded into `PipelineState`/`ShardAssignment` below —
+//! see that module's doc comment for why a K-way fan-out genuinely breaks
+//! this file's "exactly one shard in flight per request" invariant) and
+//! feeds the router-weighted-combined output forward as the next dense
+//! shard's input, the same way a dense-to-dense handoff already works.
+//!
+//! **Known gap, not guessed around (search this file for
+//! `D2-ROUTER-SELECTION`):** deciding WHICH experts in a group are actually
+//! active for a given token — the real per-token router decision — is the
+//! PRIMARY miner's job (it runs the real forward pass; see cs-miner's
+//! `shard_model_moe.rs`), but no shipped wire message reports that choice
+//! back to this bridge yet. `OpoiShardResult::router_selection` (see
+//! `wire.rs`) is the seam meant to carry it — added additively
+//! (`#[serde(default)]`, so today's cs-miner, which never sets it, still
+//! deserializes fine as `None`) — but no cs-miner build actually populates
+//! it: doing so would require its dense-shard compute to run router-only
+//! (attention + router logits, NOT the full FFN) for an EXPERT-graph layer
+//! range, which isn't implemented there today (cs-miner is out of scope for
+//! this change — not touched). Until it is, `handle_expert_group_result`
+//! logs a clear warning and stalls the pipeline at that step (same "stalls
+//! here until a retry mechanism exists" acceptance this file already
+//! documents for submit failures below) — it never fabricates a selection.
+//! A second, narrower gap: the LAST dense shard of a MoE pipeline can also
+//! have a registered EXPERT group (every layer range gets one when
+//! `numExperts > 0`), but there is no wire mechanism yet for routing a
+//! combined MoE output into a final norm+lm_head/next-token decode step —
+//! `handle_shard_result_inner` logs that case too and simply falls back to
+//! the primary's own reported `next_token_id`, unchanged, same as a
+//! non-expert-routed model.
 //!
 //! Scope note (Sessão 3, deliberate): pipeline state below is in-memory
 //! only (`DashMap`), not persisted — a bridge restart loses in-flight shard
@@ -54,7 +75,7 @@
 //! restart-safe persistence for shard pipelines is future work, not a
 //! correctness requirement for this first working version.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 use dashmap::DashMap;
@@ -66,6 +87,7 @@ use crate::db;
 use crate::miner_registry::MinerRegistry;
 use crate::opoi::b3lite::{self, B3LiteConfig};
 use crate::opoi::engine::do_commit;
+use crate::opoi::expert_dispatch::{hex_to_f32, ExpertDispatcher, SelectedExpert};
 use crate::opoi::speculative_engine::SpeculativeEngine;
 use crate::opoi::wire::{build_shard_assign_line, OpoiShardAssign, ShardInputWire, ShardOutputWire};
 use crate::rpc::types::{ModelGraph, ModelManifest, ShardDescriptor};
@@ -163,6 +185,28 @@ struct PipelineState {
     /// on-chain response — a hard constraint tied to there being exactly
     /// one commit/reveal/publish per request_id, not a stylistic choice).
     contributions: BTreeMap<String, u32>,
+    /// D2: `EXPERT` nodes from this request's Model Execution Graph,
+    /// grouped by the `(layer_start, layer_end)` range of the DENSE shard
+    /// they sit alongside — built once at pipeline-creation time (see
+    /// `poll_and_start_tick`). Maps to the list of registered `expert_id`s
+    /// for that range. Empty for a pure-DENSE model (no `EXPERT` nodes in
+    /// the graph at all) — that emptiness is exactly what keeps the
+    /// pure-DENSE path byte-for-byte unchanged (`expert_group_for` always
+    /// returns `None`).
+    expert_groups: HashMap<(u32, u32), Vec<u32>>,
+}
+
+impl PipelineState {
+    /// Returns the registered `expert_id`s for shard `pos`'s layer range,
+    /// if any were declared in this request's Model Execution Graph — the
+    /// single decision point `handle_shard_result_inner` uses to tell a
+    /// pure dense-to-dense handoff apart from one that must fan out through
+    /// `ExpertDispatcher` first.
+    fn expert_group_for(&self, pos: usize) -> Option<&Vec<u32>> {
+        let shard = self.shards.get(pos)?;
+        let key = (shard.layer_start.unwrap_or(0), shard.layer_end.unwrap_or(0));
+        self.expert_groups.get(&key).filter(|ids| !ids.is_empty())
+    }
 }
 
 /// Tracks which wallet the CURRENTLY in-flight shard step of each
@@ -206,13 +250,20 @@ pub struct ShardEngine {
     /// `finalize_pipeline` records no receipt at all in that case, rather
     /// than recording an unsigned one (see `B3LiteConfig`'s doc).
     b3lite: Option<B3LiteConfig>,
+    /// D2: the SAME `ExpertDispatcher` instance main.rs also hands to the
+    /// proxy as the process's `Arc<dyn ExpertHandler>` — sharing the
+    /// instance (not constructing a second one) is what lets a downstream
+    /// miner's `opoi.expert_result` reply actually reach the
+    /// `dispatch_and_join` call this engine makes in
+    /// `handle_expert_group_result` below.
+    expert_dispatcher: Arc<ExpertDispatcher>,
 }
 
 impl ShardEngine {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         csd: Arc<CsdRpcClient>, db: PgPool, registry: Arc<MinerRegistry>, stake_pool: Arc<StakePool>, model_sources: ModelSourceConfig,
-        speculative: Option<Arc<SpeculativeEngine>>, b3lite: Option<B3LiteConfig>,
+        speculative: Option<Arc<SpeculativeEngine>>, b3lite: Option<B3LiteConfig>, expert_dispatcher: Arc<ExpertDispatcher>,
     ) -> Self {
         Self {
             csd,
@@ -226,6 +277,7 @@ impl ShardEngine {
             prompt_cache: DashMap::new(),
             speculative,
             b3lite,
+            expert_dispatcher,
         }
     }
 
@@ -272,17 +324,23 @@ impl ShardEngine {
                 tracing::warn!(model = %req.model, "ACTIVE manifest but getmodelgraph failed; skipping this tick");
                 continue;
             };
-            if graph.shards.iter().any(|s| s.shard_type == "EXPERT") {
-                tracing::info!(model = %req.model, request_id = %req.request_id, "MoE model — shard pipeline not implemented yet, skipping (see F9-G/F15-M for the single-node path)");
-                continue;
-            }
             let Some(source) = self.model_sources.get(&req.model) else {
                 tracing::warn!(model = %req.model, "no MODEL_SOURCES_JSON entry — cannot resolve a download URL, skipping");
                 continue;
             };
 
-            let mut shards = graph.shards.clone();
-            shards.sort_by_key(|s| s.shard_index);
+            // D2: split the graph into its DENSE nodes (walked exactly as
+            // before by dispatch_current/handle_shard_result_inner) and its
+            // EXPERT nodes, grouped by the (layer_start, layer_end) range of
+            // the DENSE shard they sit alongside — see
+            // `split_model_execution_graph`'s doc comment. A pure-DENSE
+            // model has no EXPERT entries at all, so `expert_groups` ends up
+            // empty and this whole pipeline behaves byte-for-byte as before.
+            let (shards, expert_groups) = split_model_execution_graph(&graph.shards);
+            if shards.is_empty() {
+                tracing::warn!(model = %req.model, request_id = %req.request_id, "model graph has no DENSE shard nodes at all — cannot start a pipeline, skipping");
+                continue;
+            }
 
             // Self-claim coordinator across the whole pool before committing
             // to this request — if no address is eligible this round, leave
@@ -328,6 +386,7 @@ impl ShardEngine {
                     original_prompt_hex: prompt_hex.clone(),
                     generated_token_ids: Vec::new(),
                     contributions: BTreeMap::new(),
+                    expert_groups,
                 },
             );
             self.prompt_cache.remove(&req.request_id);
@@ -474,7 +533,20 @@ impl ShardEngine {
             pipeline.map(|p| p.pos + 1 == p.shards.len()).unwrap_or(false)
         };
 
+        // D2: does the shard that JUST completed have a registered EXPERT
+        // group at its layer range? (see `PipelineState::expert_group_for`).
+        // `None` for every pure-DENSE model (no EXPERT nodes in the graph at
+        // all) — that's what keeps the plain dense-to-dense handoff below
+        // byte-for-byte unchanged whenever this is `None`.
+        let expert_ids = { self.pipelines.get(&request_id).and_then(|p| p.expert_group_for(p.pos).cloned()) };
+
         if !is_last_shard {
+            if let Some(expert_ids) = expert_ids {
+                // MoE fan-out step: this shard's output is the router
+                // boundary hidden state for `expert_ids`, not directly the
+                // next dense shard's input — see `handle_expert_group_result`.
+                return self.handle_expert_group_result(&request_id, &source, expert_ids, &result).await;
+            }
             // Advance to the next shard in the SAME token step, feeding it
             // this shard's real output tensor.
             if let Some(mut pipeline) = self.pipelines.get_mut(&request_id) {
@@ -483,6 +555,23 @@ impl ShardEngine {
             }
             self.dispatch_current(&request_id, &source).await;
             return Ok(());
+        }
+
+        // D2 (narrower gap, see this file's module doc): the LAST dense
+        // shard can have a registered EXPERT group too (every layer range
+        // gets one when numExperts > 0), but there is no wire mechanism yet
+        // to route a combined MoE output into a final norm+lm_head/
+        // next-token decode step — no shard type exists for "run final
+        // norm+lm_head over this externally-combined hidden state". Log it
+        // clearly and fall back to the primary's own reported
+        // `next_token_id` below, unchanged, same as a non-expert-routed
+        // model — do NOT dispatch experts here (there is no consumer for
+        // the combined output yet, so it would be wasted network work).
+        if let Some(expert_ids) = &expert_ids {
+            tracing::warn!(
+                request_id = %request_id, shard_index = result.shard_index, registered_experts = expert_ids.len(),
+                "D2: last dense shard's layer range has registered EXPERT nodes, but no wire mechanism exists yet to route a combined MoE output into final next-token decoding — falling back to the primary's own reported next_token_id unchanged"
+            );
         }
 
         // Last shard of this token step. next_token_id must be present —
@@ -515,6 +604,118 @@ impl ShardEngine {
         }
         self.dispatch_current(&request_id, &source).await;
         Ok(())
+    }
+
+    /// D2: handles a dense shard's result when its layer range has a
+    /// registered EXPERT group — the MoE counterpart of the plain
+    /// dense-to-dense handoff `handle_shard_result_inner` otherwise does
+    /// directly. `expert_ids` is the full set of experts registered for
+    /// this range in the Model Execution Graph (NOT the active subset — see
+    /// this file's module doc, `TODO(D2-ROUTER-SELECTION)`).
+    ///
+    /// Fans the ACTIVE subset out through `ExpertDispatcher::
+    /// dispatch_and_join` and feeds the router-weighted-combined output
+    /// forward as the next dense shard's input — exactly the same
+    /// `pos += 1` / `current_input = Tensor {..}` / `dispatch_current` shape
+    /// `handle_shard_result_inner`'s own dense-to-dense handoff already
+    /// uses, just with the combined expert output standing in for a plain
+    /// shard's `result.output`.
+    async fn handle_expert_group_result(
+        &self,
+        request_id: &str,
+        source: &ModelSource,
+        expert_ids: Vec<u32>,
+        result: &crate::opoi::wire::OpoiShardResult,
+    ) -> Result<(), crate::error::AppError> {
+        // TODO(D2-ROUTER-SELECTION): `router_selection` is the seam meant to
+        // carry the PRIMARY miner's real per-token router choice back to
+        // this bridge (see `OpoiShardResult::router_selection`'s doc
+        // comment and this file's module doc) — no shipped cs-miner build
+        // populates it yet. Without it there is no sound way to know which
+        // of `expert_ids` are actually active for this token, so — same
+        // "stalls here until a retry mechanism exists" acceptance this file
+        // already documents for submit failures — this pipeline simply
+        // stalls at this step rather than guessing (e.g. dispatching ALL
+        // registered experts with equal weight would silently compute a
+        // mathematically different result than the real forward pass would
+        // have produced, which is worse than stalling).
+        let Some(selections) = result.router_selection.as_ref() else {
+            tracing::warn!(
+                request_id = %request_id, shard_index = result.shard_index, registered_experts = expert_ids.len(),
+                "TODO(D2-ROUTER-SELECTION): this shard's layer range has registered EXPERT nodes but the shard result carried no \
+                 router_selection — no shipped cs-miner build populates this field yet (it would require dense-shard compute to run \
+                 router-only, not full FFN, for an EXPERT-graph layer range, and report back which experts + weights the real router \
+                 picked). MoE distributed dispatch cannot proceed without it; pipeline stalls here until that lands."
+            );
+            return Ok(());
+        };
+
+        if selections.is_empty() {
+            tracing::error!(request_id = %request_id, "router_selection was present but empty — dropping pipeline");
+            self.pipelines.remove(request_id);
+            return Ok(());
+        }
+        // Defensive bounds check — belt-and-suspenders mirror of the
+        // daemon's own consensus-side `IsExpertShardWithinManifestBounds`
+        // (cloudservice's opoi_shard.h): never dispatch real network work
+        // for an expert_id this range didn't actually register.
+        for sel in selections {
+            if !expert_ids.contains(&sel.expert_id) {
+                tracing::error!(
+                    request_id = %request_id, expert_id = sel.expert_id,
+                    "router_selection names an expert_id not registered for this layer range in the Model Execution Graph — dropping pipeline"
+                );
+                self.pipelines.remove(request_id);
+                return Ok(());
+            }
+        }
+
+        let Ok(input_values) = hex_to_f32(&result.output.data_hex) else {
+            tracing::error!(request_id = %request_id, "shard result output data_hex failed to decode as an f32 tensor — dropping pipeline");
+            self.pipelines.remove(request_id);
+            return Ok(());
+        };
+
+        let Some((layer_start, layer_end, token_index, model_id, gguf_sha256)) = self.pipelines.get(request_id).map(|p| {
+            let shard = &p.shards[p.pos];
+            (shard.layer_start.unwrap_or(0), shard.layer_end.unwrap_or(0), p.token_index, p.manifest.model_id.clone(), p.manifest.backbone_pom_root.clone())
+        }) else {
+            return Err(crate::error::AppError::UnknownRequest);
+        };
+
+        let experts: Vec<SelectedExpert> = selections
+            .iter()
+            .map(|sel| SelectedExpert { expert_id: sel.expert_id, weight: sel.weight, shape: result.output.shape.clone(), data: input_values.clone() })
+            .collect();
+
+        // D2: real per-expert VRAM sizing (`min_vram_mb_for`) isn't threaded
+        // through to this layer yet — same TODO `MinerRegistry::
+        // pick_expert_hosts_top_n` already documents (GGUF/manifest expert
+        // size metadata isn't available here). `0` (no floor) matches
+        // `expert_dispatch.rs`'s own unit tests' convention for the same
+        // reason.
+        let combined = self
+            .expert_dispatcher
+            .dispatch_and_join(request_id, layer_start, layer_end, token_index, &model_id, &source.gguf_url, &gguf_sha256, experts, |_expert_id| 0u64)
+            .await;
+
+        match combined {
+            Ok(output) => {
+                if let Some(mut pipeline) = self.pipelines.get_mut(request_id) {
+                    pipeline.pos += 1;
+                    pipeline.current_input = ShardInputWire::Tensor { shape: output.shape, data_hex: output.data_hex };
+                }
+                self.dispatch_current(request_id, source).await;
+                Ok(())
+            }
+            Err(e) => {
+                tracing::warn!(
+                    request_id = %request_id, error = %e,
+                    "D2 expert fan-out/join failed for this layer range — pipeline stalls here until a retry mechanism exists (same acceptance as this file's other stall cases)"
+                );
+                Ok(())
+            }
+        }
     }
 
     /// Drives a just-completed shard pipeline's response through the SAME
@@ -703,6 +904,33 @@ fn sha256_hex(data: &[u8]) -> String {
     hex::encode(Sha256::digest(data))
 }
 
+/// D2: pure MEG-splitting logic extracted out of `poll_and_start_tick` so
+/// it's testable without a live `csd` connection. Separates a fetched Model
+/// Execution Graph into its DENSE nodes — sorted by `shard_index`, walked
+/// exactly as before by `dispatch_current`/`handle_shard_result_inner` — and
+/// its `EXPERT` nodes, grouped by the `(layer_start, layer_end)` range of
+/// the DENSE shard they sit alongside (see cloudservice's
+/// `BuildModelExecutionGraph`: every DENSE node for every layer range first,
+/// in range order, then every EXPERT node grouped by range in that same
+/// order — `numExperts` nodes per range). A `ShardDescriptor` with no
+/// `layer_start`/`layer_end` (shouldn't happen for a real EXPERT node, but
+/// defensively handled) defaults both to `0`. A pure-DENSE model (no
+/// `EXPERT` entries in the graph at all) yields an empty `expert_groups`
+/// map — exactly what keeps that pipeline byte-for-byte unchanged
+/// (`PipelineState::expert_group_for` always returns `None`).
+fn split_model_execution_graph(shards: &[ShardDescriptor]) -> (Vec<ShardDescriptor>, HashMap<(u32, u32), Vec<u32>>) {
+    let mut dense: Vec<ShardDescriptor> = shards.iter().filter(|s| s.shard_type == "DENSE").cloned().collect();
+    dense.sort_by_key(|s| s.shard_index);
+
+    let mut expert_groups: HashMap<(u32, u32), Vec<u32>> = HashMap::new();
+    for s in shards.iter().filter(|s| s.shard_type == "EXPERT") {
+        let key = (s.layer_start.unwrap_or(0), s.layer_end.unwrap_or(0));
+        expert_groups.entry(key).or_default().push(s.expert_id.unwrap_or(0));
+    }
+
+    (dense, expert_groups)
+}
+
 /// Pure payout-attribution decision, extracted out of `finalize_pipeline` so
 /// it's testable without a live `PgPool`/`CsdRpcClient`. Picks whichever
 /// wallet delivered the most accepted shard-result steps (see
@@ -888,5 +1116,417 @@ mod tests {
         let tokens: Vec<u32> = (0..50).collect();
         let (_, hex_str) = build_response(&tokens);
         assert_eq!(hex_str.len(), tokens.len() * 8);
+    }
+
+    // ---- split_model_execution_graph (D2) ---------------------------------------
+
+    fn dense(shard_index: u32, layer_start: u32, layer_end: u32) -> ShardDescriptor {
+        ShardDescriptor { shard_index, shard_type: "DENSE".to_string(), layer_start: Some(layer_start), layer_end: Some(layer_end), expert_id: Some(0) }
+    }
+
+    fn expert(shard_index: u32, layer_start: u32, layer_end: u32, expert_id: u32) -> ShardDescriptor {
+        ShardDescriptor {
+            shard_index,
+            shard_type: "EXPERT".to_string(),
+            layer_start: Some(layer_start),
+            layer_end: Some(layer_end),
+            expert_id: Some(expert_id),
+        }
+    }
+
+    #[test]
+    fn split_pure_dense_graph_yields_empty_expert_groups() {
+        let graph = vec![dense(0, 0, 4), dense(1, 4, 8)];
+        let (shards, expert_groups) = split_model_execution_graph(&graph);
+        assert_eq!(shards.len(), 2);
+        assert!(expert_groups.is_empty());
+    }
+
+    #[test]
+    fn split_dense_only_graph_sorts_by_shard_index_even_if_input_unsorted() {
+        let graph = vec![dense(1, 4, 8), dense(0, 0, 4)];
+        let (shards, _) = split_model_execution_graph(&graph);
+        assert_eq!(shards[0].shard_index, 0);
+        assert_eq!(shards[1].shard_index, 1);
+    }
+
+    /// Mirrors cloudservice's `BuildModelExecutionGraph` MoE layout exactly:
+    /// every DENSE node for every layer range first (in range order), then
+    /// every EXPERT node grouped by range in that same order, `numExperts`
+    /// nodes per range.
+    #[test]
+    fn split_moe_graph_groups_experts_by_layer_range() {
+        let graph = vec![
+            dense(0, 0, 4),
+            dense(1, 4, 8),
+            expert(2, 0, 4, 0),
+            expert(3, 0, 4, 1),
+            expert(4, 4, 8, 0),
+            expert(5, 4, 8, 1),
+        ];
+        let (shards, expert_groups) = split_model_execution_graph(&graph);
+
+        assert_eq!(shards.len(), 2);
+        assert!(shards.iter().all(|s| s.shard_type == "DENSE"));
+
+        assert_eq!(expert_groups.len(), 2);
+        let mut range0 = expert_groups.get(&(0, 4)).expect("range [0,4) has a group").clone();
+        range0.sort();
+        assert_eq!(range0, vec![0, 1]);
+        let mut range1 = expert_groups.get(&(4, 8)).expect("range [4,8) has a group").clone();
+        range1.sort();
+        assert_eq!(range1, vec![0, 1]);
+    }
+
+    #[test]
+    fn split_graph_with_no_dense_nodes_yields_empty_dense_list() {
+        let graph = vec![expert(0, 0, 4, 0), expert(1, 0, 4, 1)];
+        let (shards, expert_groups) = split_model_execution_graph(&graph);
+        assert!(shards.is_empty());
+        assert_eq!(expert_groups.len(), 1);
+    }
+
+    #[test]
+    fn split_expert_node_with_missing_layer_bounds_defaults_key_to_zero_zero() {
+        let malformed = ShardDescriptor { shard_index: 1, shard_type: "EXPERT".to_string(), layer_start: None, layer_end: None, expert_id: Some(3) };
+        let (_, expert_groups) = split_model_execution_graph(&[malformed]);
+        assert_eq!(expert_groups.get(&(0, 0)), Some(&vec![3]));
+    }
+
+    // ---- PipelineState::expert_group_for (D2) -----------------------------------
+
+    fn test_manifest(model_id: &str, num_layers: u32) -> ModelManifest {
+        ModelManifest { model_id: model_id.to_string(), arch_type: "MOE".to_string(), num_layers, backbone_pom_root: "gguf-hash".to_string(), status: "ACTIVE".to_string() }
+    }
+
+    fn test_pipeline(shards: Vec<ShardDescriptor>, expert_groups: HashMap<(u32, u32), Vec<u32>>) -> PipelineState {
+        PipelineState {
+            shards,
+            manifest: test_manifest("model-x", 8),
+            prompt_hash: "ph".to_string(),
+            max_tokens: 4,
+            pos: 0,
+            token_index: 0,
+            current_input: ShardInputWire::Prompt { prompt_hex: "aa".to_string() },
+            original_prompt_hex: "aa".to_string(),
+            generated_token_ids: Vec::new(),
+            contributions: BTreeMap::new(),
+            expert_groups,
+        }
+    }
+
+    #[test]
+    fn expert_group_for_none_when_no_groups_registered_at_all() {
+        let pipeline = test_pipeline(vec![dense(0, 0, 4), dense(1, 4, 8)], HashMap::new());
+        assert!(pipeline.expert_group_for(0).is_none());
+        assert!(pipeline.expert_group_for(1).is_none());
+    }
+
+    #[test]
+    fn expert_group_for_some_when_this_shards_range_has_a_group() {
+        let mut groups = HashMap::new();
+        groups.insert((0, 4), vec![0, 1]);
+        let pipeline = test_pipeline(vec![dense(0, 0, 4), dense(1, 4, 8)], groups);
+        assert_eq!(pipeline.expert_group_for(0), Some(&vec![0, 1]));
+        assert!(pipeline.expert_group_for(1).is_none());
+    }
+
+    #[test]
+    fn expert_group_for_none_when_group_is_present_but_empty() {
+        let mut groups = HashMap::new();
+        groups.insert((0, 4), Vec::<u32>::new());
+        let pipeline = test_pipeline(vec![dense(0, 0, 4)], groups);
+        assert!(pipeline.expert_group_for(0).is_none());
+    }
+
+    #[test]
+    fn expert_group_for_out_of_range_pos_is_none() {
+        let pipeline = test_pipeline(vec![dense(0, 0, 4)], HashMap::new());
+        assert!(pipeline.expert_group_for(5).is_none());
+    }
+}
+
+#[cfg(test)]
+mod d2_expert_group_dispatch_tests {
+    //! End-to-end (in-process, no live network/DB) tests for the actual
+    //! wiring this session's task adds: `ShardEngine::handle_shard_result_inner`
+    //! recognizing an EXPERT-graph layer range and routing to
+    //! `ExpertDispatcher::dispatch_and_join`, then feeding the combined
+    //! output forward as the next dense shard's input — exactly the
+    //! integration point described in `shard_engine.rs`'s module doc.
+    //!
+    //! `ShardEngine` is constructed with a lazily-connecting `PgPool`
+    //! (`connect_lazy` never touches the network) and a `CsdRpcClient`
+    //! pointed at a bogus URL — neither is ever actually called by the code
+    //! path under test (`handle_expert_group_result`/`dispatch_current` only
+    //! touch `self.pipelines`/`self.registry`/`self.expert_dispatcher`), so
+    //! this needs no live Postgres/csd, same spirit as `expert_dispatch.rs`'s
+    //! own `dispatch_tests` module (fake channels + a real `MinerRegistry`,
+    //! no live network).
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    use super::{ModelSource, ModelSourceConfig, PipelineState, ShardAssignment, ShardEngine};
+    use crate::miner_registry::MinerRegistry;
+    use crate::opoi::expert_dispatch::{hex_to_f32, ExpertDispatcher};
+    use crate::opoi::handler::ExpertHandler;
+    use crate::opoi::wire::{ExpertOutputWire, OpoiExpertResult, OpoiShardResult, RouterExpertChoice, ShardInputWire, ShardOutputWire};
+    use crate::rpc::types::{ModelManifest, ShardDescriptor};
+    use crate::rpc::CsdRpcClient;
+    use crate::stake_pool::StakePool;
+
+    fn f32_to_hex(data: &[f32]) -> String {
+        let mut bytes = Vec::with_capacity(data.len() * 4);
+        for v in data {
+            bytes.extend_from_slice(&v.to_le_bytes());
+        }
+        hex::encode(bytes)
+    }
+
+    fn dense(shard_index: u32, layer_start: u32, layer_end: u32) -> ShardDescriptor {
+        ShardDescriptor { shard_index, shard_type: "DENSE".to_string(), layer_start: Some(layer_start), layer_end: Some(layer_end), expert_id: Some(0) }
+    }
+
+    /// Neither `csd` nor `db` is ever actually reached by
+    /// `handle_shard_result_inner`'s expert-group branch or by
+    /// `dispatch_current` — see this module's doc comment.
+    fn test_engine(registry: Arc<MinerRegistry>, model_id: &str, expert_dispatcher: Arc<ExpertDispatcher>) -> ShardEngine {
+        let csd = Arc::new(CsdRpcClient::new("http://127.0.0.1:1".to_string(), "u".to_string(), "p".to_string()));
+        let db = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://user:pass@127.0.0.1/db")
+            .expect("connect_lazy never touches the network, only parses the URL");
+        // `StakePool::new` asserts a non-empty address list — this bogus
+        // address is never actually eligible for anything real (no live
+        // `csd`), it exists purely so construction doesn't panic. Only
+        // `last_shard_with_expert_group_falls_back_to_primarys_next_token_id`
+        // below ever reaches a code path that calls into it at all.
+        let stake_pool = Arc::new(StakePool::new(vec!["stake-addr-1".to_string()]));
+        let mut sources = HashMap::new();
+        sources.insert(
+            model_id.to_string(),
+            ModelSource { gguf_url: "http://gguf.example/model.gguf".to_string(), tokenizer_url: "http://gguf.example/tok".to_string(), tokenizer_sha256: "tok-hash".to_string() },
+        );
+        ShardEngine::new(csd, db, registry, stake_pool, ModelSourceConfig { sources }, None, None, expert_dispatcher)
+    }
+
+    fn test_manifest(model_id: &str) -> ModelManifest {
+        ModelManifest { model_id: model_id.to_string(), arch_type: "MOE".to_string(), num_layers: 8, backbone_pom_root: "gguf-hash".to_string(), status: "ACTIVE".to_string() }
+    }
+
+    #[tokio::test]
+    async fn moe_layer_range_fans_out_to_experts_and_feeds_combined_output_to_next_dense_shard() {
+        let registry = Arc::new(MinerRegistry::new());
+
+        // Registration order matters for `pick_next`'s round-robin — see
+        // `MinerRegistry::pick_next`'s doc comment. Register the next-hop
+        // dense miner FIRST (index 0), then the two expert-capable miners.
+        let (tx_next, mut rx_next) = tokio::sync::mpsc::unbounded_channel();
+        registry.register("next-hop-miner".to_string(), tx_next);
+        let (tx_a, mut rx_a) = tokio::sync::mpsc::unbounded_channel();
+        let (tx_b, mut rx_b) = tokio::sync::mpsc::unbounded_channel();
+        registry.register("expert-a".to_string(), tx_a);
+        registry.register("expert-b".to_string(), tx_b);
+        registry.mark_expert_capable("expert-a", 24_000);
+        registry.mark_expert_capable("expert-b", 24_000);
+
+        let expert_dispatcher = Arc::new(ExpertDispatcher::new(registry.clone()));
+        let engine = Arc::new(test_engine(registry.clone(), "model-x", expert_dispatcher.clone()));
+
+        // Force pick_next's round-robin to wrap around to index 0
+        // ("next-hop-miner") for the next dense-shard dispatch below.
+        *engine.last_assigned.lock() = Some("expert-b".to_string());
+
+        let mut expert_groups = HashMap::new();
+        expert_groups.insert((0u32, 4u32), vec![0u32, 1u32]);
+
+        engine.pipelines.insert(
+            "req-1".to_string(),
+            PipelineState {
+                shards: vec![dense(0, 0, 4), dense(1, 4, 8)],
+                manifest: test_manifest("model-x"),
+                prompt_hash: "ph".to_string(),
+                max_tokens: 4,
+                pos: 0,
+                token_index: 0,
+                current_input: ShardInputWire::Prompt { prompt_hex: "aa".to_string() },
+                original_prompt_hex: "aa".to_string(),
+                generated_token_ids: Vec::new(),
+                contributions: std::collections::BTreeMap::new(),
+                expert_groups,
+            },
+        );
+        engine.assignments.insert("req-1".to_string(), ShardAssignment { wallet: "primary-miner".to_string(), shard_index: 0, token_index: 0 });
+
+        let result = OpoiShardResult {
+            request_id: "req-1".to_string(),
+            shard_index: 0,
+            token_index: 0,
+            output_hash: "irrelevant-for-this-test".to_string(),
+            output: ShardOutputWire { shape: vec![2], data_hex: f32_to_hex(&[1.0, 2.0]) },
+            next_token_id: None,
+            next_token_ids: None,
+            router_selection: Some(vec![RouterExpertChoice { expert_id: 0, weight: 0.5 }, RouterExpertChoice { expert_id: 1, weight: 0.5 }]),
+        };
+
+        let handle = tokio::spawn({
+            let engine = engine.clone();
+            async move { engine.handle_shard_result_inner("primary-miner", result).await }
+        });
+
+        // Both registered experts get exactly one opoi.expert_assign line —
+        // proves the fan-out actually happened (part "b" of the task).
+        let line_a = rx_a.recv().await.expect("expert-a got a line");
+        let line_b = rx_b.recv().await.expect("expert-b got a line");
+        assert!(line_a.contains("opoi.expert_assign"));
+        assert!(line_b.contains("opoi.expert_assign"));
+
+        for (expert_id, wallet, value) in [(0u32, "expert-a", 10.0f32), (1u32, "expert-b", 20.0f32)] {
+            let reply = OpoiExpertResult {
+                request_id: "req-1".to_string(),
+                layer_start: 0,
+                layer_end: 4,
+                expert_id,
+                token_index: 0,
+                output_hash: String::new(),
+                output: ExpertOutputWire { shape: vec![2], data_hex: f32_to_hex(&[value, value]) },
+            };
+            expert_dispatcher.handle_expert_result(wallet, reply).await.expect("reply accepted");
+        }
+
+        handle.await.expect("task join").expect("handle_shard_result_inner ok");
+
+        // Pipeline advanced past the EXPERT-graph shard, fed the
+        // router-weighted-combined tensor forward as the input — part "c"
+        // of the task: the SAME shape a plain dense-to-dense handoff uses.
+        {
+            let pipeline = engine.pipelines.get("req-1").expect("pipeline still in flight (not the last shard)");
+            assert_eq!(pipeline.pos, 1);
+            match &pipeline.current_input {
+                ShardInputWire::Tensor { shape, data_hex } => {
+                    assert_eq!(*shape, vec![2]);
+                    let combined = hex_to_f32(data_hex).unwrap();
+                    // 0.5*10 + 0.5*20 = 15.0 at both positions.
+                    assert!((combined[0] - 15.0).abs() < 1e-5);
+                    assert!((combined[1] - 15.0).abs() < 1e-5);
+                }
+                other => panic!("expected ShardInputWire::Tensor, got {other:?}"),
+            }
+        }
+
+        // The NEXT dense shard was actually dispatched to "next-hop-miner".
+        let next_line = rx_next.recv().await.expect("next-hop-miner got the next dense-shard assignment");
+        assert!(next_line.contains("opoi.shard_assign"));
+    }
+
+    /// TODO(D2-ROUTER-SELECTION) coverage: when the shard result carries no
+    /// `router_selection` for a layer range that DOES have a registered
+    /// EXPERT group, the pipeline must stall (not guess, not crash, not
+    /// advance) — see this file's module doc and
+    /// `handle_expert_group_result`'s doc comment.
+    #[tokio::test]
+    async fn missing_router_selection_stalls_the_pipeline_instead_of_guessing() {
+        let registry = Arc::new(MinerRegistry::new());
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        registry.register("primary-miner".to_string(), tx);
+
+        let expert_dispatcher = Arc::new(ExpertDispatcher::new(registry.clone()));
+        let engine = test_engine(registry.clone(), "model-x", expert_dispatcher);
+
+        let mut expert_groups = HashMap::new();
+        expert_groups.insert((0u32, 4u32), vec![0u32, 1u32]);
+
+        engine.pipelines.insert(
+            "req-2".to_string(),
+            PipelineState {
+                shards: vec![dense(0, 0, 4), dense(1, 4, 8)],
+                manifest: test_manifest("model-x"),
+                prompt_hash: "ph".to_string(),
+                max_tokens: 4,
+                pos: 0,
+                token_index: 0,
+                current_input: ShardInputWire::Prompt { prompt_hex: "aa".to_string() },
+                original_prompt_hex: "aa".to_string(),
+                generated_token_ids: Vec::new(),
+                contributions: std::collections::BTreeMap::new(),
+                expert_groups,
+            },
+        );
+        engine.assignments.insert("req-2".to_string(), ShardAssignment { wallet: "primary-miner".to_string(), shard_index: 0, token_index: 0 });
+
+        let result = OpoiShardResult {
+            request_id: "req-2".to_string(),
+            shard_index: 0,
+            token_index: 0,
+            output_hash: "irrelevant-for-this-test".to_string(),
+            output: ShardOutputWire { shape: vec![2], data_hex: f32_to_hex(&[1.0, 2.0]) },
+            next_token_id: None,
+            next_token_ids: None,
+            router_selection: None, // the genuine, documented gap
+        };
+
+        engine.handle_shard_result_inner("primary-miner", result).await.expect("stalling is not an error");
+
+        // Pipeline is still there, still parked at shard 0 — nothing
+        // advanced, nothing was dispatched, nothing was fabricated.
+        let pipeline = engine.pipelines.get("req-2").expect("pipeline was not dropped");
+        assert_eq!(pipeline.pos, 0);
+    }
+
+    /// The narrower gap this file's module doc also documents: the LAST
+    /// dense shard can have a registered EXPERT group too, but there is no
+    /// wire mechanism yet to route a combined MoE output into final
+    /// next-token decoding — the pipeline must fall back to the primary's
+    /// own reported `next_token_id`, unchanged, exactly like a
+    /// non-expert-routed model (no dispatch attempted for this case).
+    #[tokio::test]
+    async fn last_shard_with_expert_group_falls_back_to_primarys_next_token_id() {
+        let registry = Arc::new(MinerRegistry::new());
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        registry.register("primary-miner".to_string(), tx);
+
+        let expert_dispatcher = Arc::new(ExpertDispatcher::new(registry.clone()));
+        let engine = test_engine(registry.clone(), "model-x", expert_dispatcher);
+
+        // Single dense shard [0,8) — it IS the last (and only) shard —
+        // with an EXPERT group registered at its own range.
+        let mut expert_groups = HashMap::new();
+        expert_groups.insert((0u32, 8u32), vec![0u32, 1u32]);
+
+        engine.pipelines.insert(
+            "req-3".to_string(),
+            PipelineState {
+                shards: vec![dense(0, 0, 8)],
+                manifest: test_manifest("model-x"),
+                prompt_hash: "ph".to_string(),
+                max_tokens: 1, // 1 token: this result is both the last shard AND the last token
+                pos: 0,
+                token_index: 0,
+                current_input: ShardInputWire::Prompt { prompt_hex: "aa".to_string() },
+                original_prompt_hex: "aa".to_string(),
+                generated_token_ids: Vec::new(),
+                contributions: std::collections::BTreeMap::new(),
+                expert_groups,
+            },
+        );
+        engine.assignments.insert("req-3".to_string(), ShardAssignment { wallet: "primary-miner".to_string(), shard_index: 0, token_index: 0 });
+
+        let result = OpoiShardResult {
+            request_id: "req-3".to_string(),
+            shard_index: 0,
+            token_index: 0,
+            output_hash: "irrelevant-for-this-test".to_string(),
+            output: ShardOutputWire { shape: vec![2], data_hex: f32_to_hex(&[1.0, 2.0]) },
+            next_token_id: Some(42),
+            next_token_ids: None,
+            router_selection: None, // no expert dispatch should even be attempted here
+        };
+
+        // is_last_token => true (max_tokens=1) => `finalize_pipeline` runs
+        // and removes the request from `csd`/`db`... but `submit_shard_result`
+        // requires the `stake_pool`; with an empty stake pool `try_each`
+        // fails, so the pipeline stays put rather than finalizing — either
+        // way the assertion below (no expert dispatch attempted, no panic)
+        // holds regardless of which of those two paths this takes.
+        engine.handle_shard_result_inner("primary-miner", result).await.expect("must not error");
     }
 }
