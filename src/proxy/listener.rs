@@ -8,7 +8,7 @@ use std::sync::Arc;
 use tokio::net::TcpListener;
 
 use crate::miner_registry::MinerRegistry;
-use crate::opoi::handler::{AuditHandler, OpoiHandler, ShardHandler, SpeculativeHandler};
+use crate::opoi::handler::{AuditHandler, ExpertHandler, OpoiHandler, ShardHandler, SpeculativeHandler};
 use crate::proxy::session;
 
 pub async fn run(
@@ -19,6 +19,7 @@ pub async fn run(
     shard_handler: Arc<dyn ShardHandler>,
     speculative_handler: Arc<dyn SpeculativeHandler>,
     audit_handler: Arc<dyn AuditHandler>,
+    expert_handler: Arc<dyn ExpertHandler>,
 ) -> anyhow::Result<()> {
     // Owned String (not &str): this future is passed to tokio::spawn from
     // main.rs and must be 'static, which rules out borrowing from Config.
@@ -43,9 +44,10 @@ pub async fn run(
         let shard_handler = shard_handler.clone();
         let speculative_handler = speculative_handler.clone();
         let audit_handler = audit_handler.clone();
+        let expert_handler = expert_handler.clone();
 
         tokio::spawn(async move {
-            match session::run_session(socket, upstream_addr, registry, handler, shard_handler, speculative_handler, audit_handler).await {
+            match session::run_session(socket, upstream_addr, registry, handler, shard_handler, speculative_handler, audit_handler, expert_handler).await {
                 Ok(()) => {
                     tracing::info!(peer = %peer_addr, "miner disconnected");
                 }

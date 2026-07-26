@@ -25,6 +25,28 @@
 //! path instead (F9-G/F15-M, `CS COIN OPoI MELHOR IMPLEMENTAÇÃO.txt`
 //! Sprint 4/8).
 //!
+//! D2 update (2026-07-26 session): the skip above is still correct today —
+//! cloudservice hasn't started emitting real per-(layer_range, expert_id)
+//! `EXPERT` nodes into the Model Execution Graph yet (separate, parallel
+//! piece of D2 work — see "ESCOPO DE IMPLEMENTAÇÃO DO D2" in the design
+//! doc), so there is nothing real for this engine to dispatch against
+//! there yet. The per-expert fan-out/join-barrier DISPATCH mechanism itself
+//! — generalizing this file's own single-assignee `ShardAssignment`/
+//! `assignments` pattern to one keyed by `(request_id, layer_start,
+//! layer_end, expert_id)`, since a single token/layer can now fan out to K
+//! wallets at once instead of the ONE this file's dense pipeline ever has
+//! in flight — already exists, in `expert_dispatch.rs::ExpertDispatcher`
+//! (kept as its own component rather than folded into `PipelineState`/
+//! `ShardAssignment` below, for the same reason `SpeculativeEngine` is its
+//! own component and not a `ShardEngine` field: a dense-pipeline
+//! `PipelineState` tracks exactly one shard/token in flight system-wide per
+//! request, an invariant the K-way MoE fan-out genuinely breaks, so forcing
+//! both shapes into one struct would mean every dense-only field grows an
+//! MoE-only sibling it never uses, and vice versa). The integration point
+//! that would call `ExpertDispatcher::dispatch_and_join` from THIS engine's
+//! `dispatch_current`/`handle_shard_result_inner` loop — once an `EXPERT`
+//! MEG node actually shows up — is future work, not attempted this pass.
+//!
 //! Scope note (Sessão 3, deliberate): pipeline state below is in-memory
 //! only (`DashMap`), not persisted — a bridge restart loses in-flight shard
 //! pipelines (they'll simply be re-picked-up from PENDING on the next poll

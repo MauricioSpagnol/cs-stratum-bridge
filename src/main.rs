@@ -14,10 +14,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use opoi::b3lite_audit::B3LiteAuditor;
-use opoi::handler::{AuditHandler, OpoiHandler, ShardHandler, SpeculativeHandler};
+use opoi::handler::{AuditHandler, ExpertHandler, OpoiHandler, ShardHandler, SpeculativeHandler};
 use opoi::shard_engine::ModelSourceConfig;
 use opoi::speculative_engine::DraftModelConfig;
-use opoi::{OpoiEngine, ShardEngine, SpeculativeEngine};
+use opoi::{ExpertDispatcher, OpoiEngine, ShardEngine, SpeculativeEngine};
 use rpc::CsdRpcClient;
 use stake_pool::StakePool;
 use state::AppState;
@@ -224,10 +224,22 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
+    // D2 (2026-07-26 session): constructed unconditionally, same reasoning
+    // as `speculative_engine`/`b3lite_auditor` above — with no MoE model's
+    // Model Execution Graph ever reaching this dispatcher yet (ShardEngine
+    // still skips any `EXPERT`-bearing graph entirely, see
+    // `shard_engine.rs`'s module doc), `ExpertDispatcher` simply never gets
+    // a `dispatch_and_join` call in practice today. It still needs to exist
+    // here so the proxy's session-level wiring always has a real
+    // `Arc<dyn ExpertHandler>` to hand a stray/late `opoi.expert_result`
+    // to (rejected as `UnknownRequest`, same as any other unmatched reply).
+    let expert_dispatcher = Arc::new(ExpertDispatcher::new(registry.clone()));
+
     let handler: Arc<dyn OpoiHandler> = engine.clone();
     let shard_handler: Arc<dyn ShardHandler> = shard_engine.clone();
     let speculative_handler: Arc<dyn SpeculativeHandler> = speculative_engine.clone();
     let audit_handler: Arc<dyn AuditHandler> = b3lite_auditor.clone();
+    let expert_handler: Arc<dyn ExpertHandler> = expert_dispatcher.clone();
     let proxy_task = tokio::spawn(proxy::listener::run(
         cfg.listen_addr.clone(),
         cfg.upstream_pool_addr.clone(),
@@ -236,6 +248,7 @@ async fn main() -> anyhow::Result<()> {
         shard_handler,
         speculative_handler,
         audit_handler,
+        expert_handler,
     ));
 
     tokio::select! {

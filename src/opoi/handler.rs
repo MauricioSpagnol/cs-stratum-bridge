@@ -6,7 +6,7 @@
 use async_trait::async_trait;
 
 use crate::error::AppError;
-use crate::opoi::wire::{OpoiAuditResult, OpoiDraftResult, OpoiKvRollbackAck, OpoiShardResult, OpoiSubmitResultParams};
+use crate::opoi::wire::{OpoiAuditResult, OpoiDraftResult, OpoiExpertResult, OpoiKvRollbackAck, OpoiShardResult, OpoiSubmitResultParams};
 
 #[async_trait]
 pub trait OpoiHandler: Send + Sync {
@@ -84,5 +84,26 @@ pub trait AuditHandler: Send + Sync {
     async fn handle_audit_result(&self, wallet: &str, result: OpoiAuditResult) -> Result<(), AppError>;
 
     /// Mirrors `ShardHandler::on_disconnect`.
+    async fn on_disconnect(&self, wallet: &str);
+}
+
+/// D2 (2026-07-26 session): the per-expert-dispatch counterpart of
+/// `AuditHandler` — kept as its own trait, same reasoning as the others
+/// (`ExpertDispatcher` is a distinct component, see `expert_dispatch.rs`'s
+/// module doc). Copied directly from `AuditHandler`'s shape per the D2
+/// scope doc ("the machinery just built for B3-lite's live audit dispatch
+/// ... is EXACTLY the mechanism D2 needs").
+#[async_trait]
+pub trait ExpertHandler: Send + Sync {
+    /// Called when an authorized downstream connection sends
+    /// `opoi.expert_result` (the reply to a previously-pushed
+    /// `opoi.expert_assign`). Returns an `AppError` if this wallet wasn't
+    /// the one dispatched to for this exact `(request_id, layer_start,
+    /// layer_end, expert_id)` fan-out member — same "assignment
+    /// verification" contract `AuditHandler::handle_audit_result` has, just
+    /// keyed more finely (see `expert_dispatch.rs::ExpertAssignmentKey`).
+    async fn handle_expert_result(&self, wallet: &str, result: OpoiExpertResult) -> Result<(), AppError>;
+
+    /// Mirrors `AuditHandler::on_disconnect`.
     async fn on_disconnect(&self, wallet: &str);
 }

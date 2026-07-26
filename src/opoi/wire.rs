@@ -342,3 +342,110 @@ pub fn build_audit_result_error(id: serde_json::Value, error_triple: serde_json:
     });
     format!("{}\n", msg)
 }
+
+// ── D2 per-expert dispatch messages (2026-07-26 session) ─────────────────
+//
+// Field names/shapes are a NEW contract (no cs-miner precedent yet — see
+// `opoi/expert_dispatch.rs`'s module doc), modeled directly on the
+// `OpoiAuditAssign`/`OpoiAuditResult` pair above per the D2 scope doc
+// ("ESCOPO DE IMPLEMENTAÇÃO DO D2", cs-stratum-bridge section): same
+// dispatch-to-a-specific-wallet-and-await-the-async-reply shape, carrying
+// (layer_range, expert_id, input activation) instead of an audit request.
+// Reconcile against cs-miner's own `expert_pool_client.rs` (parallel work,
+// separate repo/session) once both sides exist — this repo only defines
+// the wire contract and the dispatch/join-barrier machinery that consumes
+// it, not a miner-side handler.
+//
+// Unlike `OpoiAuditAssign`, there is no `tokenizer_url`/`tokenizer_sha256`
+// here: an expert's FFN forward pass never tokenizes raw text, only
+// consumes/produces hidden-state tensors (same reasoning `OpoiShardAssign`
+// already applies to every non-entry dense shard).
+
+/// Pushed downstream (bridge -> miner) as an `opoi.expert_assign`
+/// notification: asks a specific VRAM-eligible wallet (see
+/// `MinerRegistry::pick_expert_host`) to run ONE expert's FFN over ONE
+/// token's activation at a pinned `(layer_start, layer_end)` range.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OpoiExpertAssign {
+    pub request_id: String,
+    /// Used the same way `OpoiShardAssign::model_id` is — a local cache key
+    /// for the miner's own GGUF fetch/cache, resolved by the bridge from
+    /// `getmodelmanifest` + `ModelSourceConfig`.
+    pub model_id: String,
+    pub layer_start: u32,
+    pub layer_end: u32,
+    pub expert_id: u32,
+    /// 0 = first token of the generation; >0 = a continuation step —
+    /// mirrors `OpoiShardAssign::token_index`.
+    pub token_index: u32,
+    pub input: ExpertInputWire,
+    /// sha256 of the exact bytes carried in `input` — lets the miner (and
+    /// this bridge's own logs) correlate this dispatch with the on-chain
+    /// routing-trace commitment (`ShardResultSubmission.routerLogitsHash`,
+    /// see the D2 scope doc's "MODELO DE REDUNDÂNCIA/VERIFICAÇÃO" section)
+    /// without needing to re-decode+re-hash the full tensor payload.
+    pub input_hash: String,
+    pub model_gguf_url: String,
+    pub model_gguf_sha256: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind")]
+pub enum ExpertInputWire {
+    Tensor { shape: Vec<usize>, data_hex: String },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExpertOutputWire {
+    pub shape: Vec<usize>,
+    pub data_hex: String,
+}
+
+/// Received from a downstream miner as `opoi.expert_result` — the reply to
+/// a previously-pushed `opoi.expert_assign`. `layer_start`/`layer_end`/
+/// `expert_id`/`token_index` are echoed back (not just `request_id`) so
+/// `ExpertDispatcher::handle_expert_result` can validate this reply against
+/// the EXACT fan-out-group member it was dispatched for — see
+/// `expert_dispatch.rs`'s `ExpertAssignmentKey` doc comment for why
+/// `request_id` alone is no longer a sufficient correlation key once a
+/// single token/layer can have K dispatches in flight at once.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OpoiExpertResult {
+    pub request_id: String,
+    pub layer_start: u32,
+    pub layer_end: u32,
+    pub expert_id: u32,
+    pub token_index: u32,
+    pub output_hash: String,
+    pub output: ExpertOutputWire,
+}
+
+pub fn build_expert_assign_line(assign: &OpoiExpertAssign) -> String {
+    let msg = serde_json::json!({
+        "jsonrpc": "2.0",
+        "method": "opoi.expert_assign",
+        "params": [assign],
+        "id": serde_json::Value::Null,
+    });
+    format!("{}\n", msg)
+}
+
+pub fn build_expert_result_ack(id: serde_json::Value) -> String {
+    let msg = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "result": { "accepted": true },
+        "error": serde_json::Value::Null,
+    });
+    format!("{}\n", msg)
+}
+
+pub fn build_expert_result_error(id: serde_json::Value, error_triple: serde_json::Value) -> String {
+    let msg = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "result": serde_json::Value::Null,
+        "error": error_triple,
+    });
+    format!("{}\n", msg)
+}

@@ -16,11 +16,11 @@ use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 
 use crate::error::AppError;
 use crate::miner_registry::MinerRegistry;
-use crate::opoi::handler::{AuditHandler, OpoiHandler, ShardHandler, SpeculativeHandler};
+use crate::opoi::handler::{AuditHandler, ExpertHandler, OpoiHandler, ShardHandler, SpeculativeHandler};
 use crate::opoi::wire::{
-    build_audit_result_ack, build_audit_result_error, build_shard_result_ack, build_shard_result_error,
-    build_submit_result_ack, build_submit_result_error, OpoiAuditResult, OpoiDraftResult, OpoiKvRollbackAck, OpoiShardResult,
-    OpoiSubmitResultParams,
+    build_audit_result_ack, build_audit_result_error, build_expert_result_ack, build_expert_result_error, build_shard_result_ack,
+    build_shard_result_error, build_submit_result_ack, build_submit_result_error, OpoiAuditResult, OpoiDraftResult, OpoiExpertResult,
+    OpoiKvRollbackAck, OpoiShardResult, OpoiSubmitResultParams,
 };
 
 /// Shared, mutable "who is this connection" state, handed off between the
@@ -46,6 +46,7 @@ pub async fn run_session(
     shard_handler: Arc<dyn ShardHandler>,
     speculative_handler: Arc<dyn SpeculativeHandler>,
     audit_handler: Arc<dyn AuditHandler>,
+    expert_handler: Arc<dyn ExpertHandler>,
 ) -> anyhow::Result<()> {
     let peer = downstream.peer_addr().ok();
 
@@ -80,7 +81,7 @@ pub async fn run_session(
     let auth = AuthState::default();
 
     tokio::select! {
-        _ = down_reader_loop(&mut down_lines, down_tx.clone(), up_tx.clone(), registry.clone(), handler.clone(), shard_handler.clone(), speculative_handler.clone(), audit_handler.clone(), auth.clone()) => {
+        _ = down_reader_loop(&mut down_lines, down_tx.clone(), up_tx.clone(), registry.clone(), handler.clone(), shard_handler.clone(), speculative_handler.clone(), audit_handler.clone(), expert_handler.clone(), auth.clone()) => {
             tracing::debug!(peer = ?peer, "downstream reader ended session");
         }
         _ = up_reader_loop(&mut up_lines, down_tx.clone(), registry.clone(), auth.clone()) => {
@@ -103,6 +104,7 @@ pub async fn run_session(
         shard_handler.on_disconnect(&wallet).await;
         speculative_handler.on_disconnect(&wallet).await;
         audit_handler.on_disconnect(&wallet).await;
+        expert_handler.on_disconnect(&wallet).await;
         tracing::info!(peer = ?peer, wallet = %wallet, "session ended; unregistered miner and released its pending assignments");
     }
 
@@ -142,6 +144,7 @@ async fn down_reader_loop(
     shard_handler: Arc<dyn ShardHandler>,
     speculative_handler: Arc<dyn SpeculativeHandler>,
     audit_handler: Arc<dyn AuditHandler>,
+    expert_handler: Arc<dyn ExpertHandler>,
     auth: AuthState,
 ) {
     loop {
@@ -251,6 +254,32 @@ async fn down_reader_loop(
                     }
                 }
             }
+            Some("opoi.expert_result") => {
+                let id = value.as_ref().and_then(|v| v.get("id")).cloned().unwrap_or(Value::Null);
+                let params_val = value.as_ref().and_then(|v| v.get("params")).and_then(|p| p.get(0)).cloned();
+
+                let parsed: Option<OpoiExpertResult> = params_val.and_then(|p| serde_json::from_value(p).ok());
+
+                let Some(result) = parsed else {
+                    let _ = down_tx.send(build_expert_result_error(id, serde_json::json!([20, "malformed opoi.expert_result", null])));
+                    continue;
+                };
+
+                let wallet = auth.confirmed.lock().clone();
+                let Some(wallet) = wallet else {
+                    let _ = down_tx.send(build_expert_result_error(id, AppError::Unauthorized.to_stratum_error()));
+                    continue;
+                };
+
+                match expert_handler.handle_expert_result(&wallet, result).await {
+                    Ok(()) => {
+                        let _ = down_tx.send(build_expert_result_ack(id));
+                    }
+                    Err(app_err) => {
+                        let _ = down_tx.send(build_expert_result_error(id, app_err.to_stratum_error()));
+                    }
+                }
+            }
             Some("opoi.draft_result") => {
                 // No reply sent back down for this one — see
                 // `SpeculativeHandler`'s doc comment for why.
@@ -295,6 +324,35 @@ async fn down_reader_loop(
                     if caps.iter().any(|c| c == "auditor") {
                         registry.mark_auditor_capable(&wallet);
                         tracing::info!(wallet = %wallet, "miner registered `auditor` capability (B3-lite)");
+                    }
+                    // D2: same `opoi.capabilities` notification, extended
+                    // with an `expert_vram_mb` field alongside `caps` —
+                    // reconcile against cs-miner's stratum handshake (see
+                    // `MinerRegistry::expert_capable_vram`'s doc comment for
+                    // the exact expected shape: `{"caps": ["expert"],
+                    // "expert_vram_mb": <u64>}`). A miner announcing
+                    // `"expert"` without a parseable `expert_vram_mb` is
+                    // treated as NOT expert-capable (0 VRAM would make it
+                    // eligible for nothing anyway, but silently defaulting
+                    // to 0 instead of skipping the mark risks a future
+                    // caller passing `min_vram_mb: 0` and getting a bogus
+                    // match) — logged as a warning, not silently ignored.
+                    if caps.iter().any(|c| c == "expert") {
+                        let vram_mb = value
+                            .as_ref()
+                            .and_then(|v| v.get("params"))
+                            .and_then(|p| p.get(0))
+                            .and_then(|p| p.get("expert_vram_mb"))
+                            .and_then(Value::as_u64);
+                        match vram_mb {
+                            Some(vram_mb) => {
+                                registry.mark_expert_capable(&wallet, vram_mb);
+                                tracing::info!(wallet = %wallet, vram_mb, "miner registered `expert` capability (D2)");
+                            }
+                            None => {
+                                tracing::warn!(wallet = %wallet, "miner announced `expert` capability with no valid `expert_vram_mb`; not marking expert-capable");
+                            }
+                        }
                     }
                 } else {
                     tracing::debug!("opoi.capabilities from an unauthorized connection; dropping");
