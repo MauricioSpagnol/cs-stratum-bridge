@@ -281,7 +281,7 @@ impl PipelineState {
 /// (request_id, shard_index)) is sufficient; `(shard_index, token_index)`
 /// carried in `OpoiShardResult` guards against a stale/duplicate submission
 /// answering a step that's no longer the current one.
-#[derive(Default)]
+#[derive(Default, Clone)]
 struct ShardAssignment {
     wallet: String,
     shard_index: u32,
@@ -977,6 +977,22 @@ impl ShardEngine {
             .await
             .unwrap_or(0);
 
+        // Race fix (found via live regtest validation, 2026-07-26) — see
+        // `handle_moe_interior_layer_result`'s identical comment for the
+        // full explanation. Same issue here: the caller already removed
+        // this request_id's assignment before routing to this method, and
+        // `dispatch_and_join` below is a real async round trip a
+        // `retry_stalled_pipelines` tick can land inside of.
+        let busy_marker = self.pipelines.get(request_id).and_then(|p| p.moe_layer_walk.clone()).map(|(_, pinned_wallet)| ShardAssignment {
+            wallet: pinned_wallet,
+            shard_index: result.shard_index,
+            token_index,
+            moe_layer_step: Some(layer_idx),
+        });
+        if let Some(marker) = busy_marker.clone() {
+            self.assignments.insert(request_id.to_string(), marker);
+        }
+
         let combined = self
             .expert_dispatcher
             .dispatch_and_join(request_id, layer_start, layer_end, layer_idx, token_index, &model_id, &source.gguf_url, &gguf_sha256, experts, move |_expert_id| min_vram_mb)
@@ -996,6 +1012,11 @@ impl ShardEngine {
                 Ok(())
             }
             Err(e) => {
+                // Remove the busy marker inserted above — see
+                // `handle_moe_interior_layer_result`'s identical Err arm
+                // for why: restores "no assignment = stalled" so the next
+                // retry tick actually re-dispatches this shard.
+                self.assignments.remove(request_id);
                 tracing::warn!(
                     request_id = %request_id, error = %e,
                     "D2 expert fan-out/join failed for this layer range — pipeline stalls here until a retry mechanism exists (same acceptance as this file's other stall cases)"
@@ -1091,6 +1112,45 @@ impl ShardEngine {
             .await
             .unwrap_or(0);
 
+        // Race fix (found via live regtest validation, 2026-07-26): the
+        // caller (`handle_shard_result_inner`) already removed this
+        // request_id's `self.assignments` entry before routing here, on the
+        // way to submitting the on-chain-submission/pos-advance logic this
+        // interior-layer path deliberately skips. But the expert fan-out/
+        // join below is itself a real async round trip (observed ~1.2s
+        // live, against experts on OTHER connections) — while it's in
+        // flight, `self.assignments` has NO entry for this request_id,
+        // which is EXACTLY `retry_stalled_pipelines`' definition of
+        // "stalled". A retry tick landing in that window (poll_interval_ms
+        // is only 3000, well within observed dispatch/combine latency)
+        // re-invoked `dispatch_current` while `pipeline.moe_layer_walk`
+        // still held the layer that just completed (not yet advanced),
+        // re-sending an IDENTICAL fresh `moe_layer_step` for a layer the
+        // miner already has an open session for — confirmed live: cs-miner's
+        // `moe_range_session.rs` correctly rejected it as a protocol
+        // violation ("fresh input but a session is already open") rather
+        // than corrupting anything, but the whole pipeline still stalled
+        // since the genuine in-flight resume never got a chance to land.
+        // Fix: reinsert a placeholder assignment (this step's own wallet/
+        // shard_index/token_index/moe_layer_step — a legitimate SECOND
+        // result for this exact step can't arrive while the miner is busy
+        // computing experts, so this can't itself be mistaken for a new
+        // real reply) for the duration of the dispatch/combine call only —
+        // removed again on failure (restoring the original "no assignment
+        // = stalled, retry next tick" behavior every other failure path in
+        // this file already relies on), left in place on success only
+        // until `dispatch_current` below inserts the real resume
+        // assignment over it.
+        let busy_marker = self.pipelines.get(request_id).and_then(|p| p.moe_layer_walk.clone()).map(|(_, pinned_wallet)| ShardAssignment {
+            wallet: pinned_wallet,
+            shard_index: result.shard_index,
+            token_index,
+            moe_layer_step: Some(layer_idx),
+        });
+        if let Some(marker) = busy_marker.clone() {
+            self.assignments.insert(request_id.to_string(), marker);
+        }
+
         let combined = self
             .expert_dispatcher
             .dispatch_and_join(request_id, layer_start, layer_end, layer_idx, token_index, &model_id, &source.gguf_url, &gguf_sha256, experts, move |_expert_id| min_vram_mb)
@@ -1112,6 +1172,12 @@ impl ShardEngine {
                 Ok(())
             }
             Err(e) => {
+                // Remove the busy marker inserted above — restores the
+                // ordinary "no assignment = stalled" contract so
+                // `retry_stalled_pipelines` actually retries this shard
+                // fresh next tick, instead of believing (wrongly) that
+                // this now-abandoned attempt is still in flight forever.
+                self.assignments.remove(request_id);
                 tracing::warn!(
                     request_id = %request_id, layer_idx, error = %e,
                     "D2 multi-layer walk: interior layer's expert fan-out/join failed — pipeline stalls here until a retry mechanism exists (same acceptance as this file's other stall cases)"
