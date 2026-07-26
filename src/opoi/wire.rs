@@ -142,27 +142,45 @@ pub struct OpoiShardResult {
     /// more `EXPERT` nodes registered in the Model Execution Graph (see
     /// `shard_engine.rs`'s `PipelineState::expert_groups`).
     ///
-    /// TODO(D2-ROUTER-SELECTION): this field is the seam meant to carry
-    /// that choice back to this bridge — added here additively
-    /// (`#[serde(default)]`, so any cs-miner build that never sets it still
-    /// deserializes fine as `None`) — but as of this writing NO shipped
-    /// cs-miner build actually populates it. Doing so would require
-    /// cs-miner's dense-shard compute to run router-only (attention +
-    /// router logits, NOT the full FFN) for an EXPERT-graph layer range,
-    /// which isn't implemented there today (a separate, cs-miner-side piece
-    /// of D2 work, out of scope for this change). Until then,
-    /// `shard_engine.rs::ShardEngine::handle_expert_group_result` logs a
-    /// clear warning and stalls the pipeline whenever this is `None` for a
-    /// shard whose range has a registered EXPERT group — it never
+    /// This is the seam that carries the primary's real per-layer choice
+    /// back to this bridge — added additively (`#[serde(default)]`, so an
+    /// older cs-miner build that never sets it still deserializes fine as
+    /// `None`). `shard_engine.rs::ShardEngine::handle_expert_group_result`
+    /// logs a clear warning and stalls the pipeline whenever this is `None`
+    /// for a shard whose range has a registered EXPERT group — it never
     /// fabricates a selection.
+    ///
+    /// **Shape (2026-07-26, multi-layer follow-up session):**
+    /// `Vec<Vec<RouterExpertChoice>>` — outer index is the LAYER OFFSET
+    /// within `(layer_start, layer_end)` (relative index: entry `0` is
+    /// `layer_start`'s pick, `.last()` is `layer_end - 1`'s). Populated by
+    /// cs-miner's `shard_pool_client.rs::compute_moe_router_only` /
+    /// `shard_model_moe.rs::MoeModelWeights::route_only_over_range` (see
+    /// that crate's doc comments for the full three-zone per-layer walk —
+    /// every entry is a genuine, independently-computed real router
+    /// selection for its layer, not fabricated or copied from a neighbor).
+    /// Mirrors `OpoiShardAssign`'s sibling `pinned_expert_ids` field's
+    /// "one entry per layer IN RANGE, relative index" convention exactly —
+    /// deliberately chosen over splitting a multi-layer range into N
+    /// separate single-layer assigns, since that convention was already
+    /// proven wire-compatible and easy to reason about for the same "one
+    /// range, N layers" shape (see cs-miner's D2 session report).
+    ///
+    /// `handle_expert_group_result` below currently only acts on `.last()`
+    /// (the range's LAST layer) for actual external per-expert dispatch —
+    /// see that method's doc comment for why interior layers' entries are
+    /// genuine but not yet externally dispatched (a documented, honest
+    /// stopping point for this session, not a silent gap): doing so needs
+    /// `ExpertDispatcher`/`PipelineState` to key a dispatch by absolute
+    /// layer index within the range, not just the range's `(layer_start,
+    /// layer_end)` bounds as it does today.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub router_selection: Option<Vec<RouterExpertChoice>>,
+    pub router_selection: Option<Vec<Vec<RouterExpertChoice>>>,
 }
 
 /// One expert the primary router selected for a `(layer_start, layer_end)`
 /// range, with the combine weight it assigned — see
-/// `OpoiShardResult::router_selection`'s doc comment. Not yet emitted by any
-/// shipped cs-miner build (TODO(D2-ROUTER-SELECTION)).
+/// `OpoiShardResult::router_selection`'s doc comment.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RouterExpertChoice {
     pub expert_id: u32,

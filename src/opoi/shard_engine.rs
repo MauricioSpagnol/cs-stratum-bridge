@@ -44,29 +44,54 @@
 //! feeds the router-weighted-combined output forward as the next dense
 //! shard's input, the same way a dense-to-dense handoff already works.
 //!
-//! **Known gap, not guessed around (search this file for
-//! `D2-ROUTER-SELECTION`):** deciding WHICH experts in a group are actually
-//! active for a given token — the real per-token router decision — is the
-//! PRIMARY miner's job (it runs the real forward pass; see cs-miner's
-//! `shard_model_moe.rs`), but no shipped wire message reports that choice
-//! back to this bridge yet. `OpoiShardResult::router_selection` (see
-//! `wire.rs`) is the seam meant to carry it — added additively
-//! (`#[serde(default)]`, so today's cs-miner, which never sets it, still
-//! deserializes fine as `None`) — but no cs-miner build actually populates
-//! it: doing so would require its dense-shard compute to run router-only
-//! (attention + router logits, NOT the full FFN) for an EXPERT-graph layer
-//! range, which isn't implemented there today (cs-miner is out of scope for
-//! this change — not touched). Until it is, `handle_expert_group_result`
-//! logs a clear warning and stalls the pipeline at that step (same "stalls
-//! here until a retry mechanism exists" acceptance this file already
-//! documents for submit failures below) — it never fabricates a selection.
-//! A second, narrower gap: the LAST dense shard of a MoE pipeline can also
-//! have a registered EXPERT group (every layer range gets one when
-//! `numExperts > 0`), but there is no wire mechanism yet for routing a
-//! combined MoE output into a final norm+lm_head/next-token decode step —
-//! `handle_shard_result_inner` logs that case too and simply falls back to
-//! the primary's own reported `next_token_id`, unchanged, same as a
-//! non-expert-routed model.
+//! **`router_selection` is now populated** by a real cs-miner build
+//! (`shard_pool_client.rs::compute_moe_router_only`, see that crate's D2
+//! session reports) — `OpoiShardResult::router_selection` (`wire.rs`)
+//! carries the primary miner's real router choice, one entry per LAYER
+//! within `(layer_start, layer_end)` (`Vec<Vec<RouterExpertChoice>>`, outer
+//! index = layer offset within the range — mirrors `OpoiShardAssign`'s
+//! sibling `pinned_expert_ids` convention, see `wire.rs`'s doc comment for
+//! the full shape rationale). Still additive (`#[serde(default)]`), so an
+//! older cs-miner build that never sets it still deserializes fine as
+//! `None` — `handle_expert_group_result` logs a clear warning and stalls
+//! the pipeline at that step whenever it's `None` (same "stalls here until
+//! a retry mechanism exists" acceptance this file already documents for
+//! submit failures below) — it never fabricates a selection.
+//!
+//! **Known gap, not guessed around (2026-07-26, multi-layer follow-up
+//! session):** a dense-boundary range CAN legally span more than one
+//! layer (cloudservice's `SplitLayerRanges` is a plain even split, nothing
+//! requires `numDenseShards == numLayers` for a MoE manifest — see
+//! cs-miner's D2 session report for the exact derivation), and cs-miner now
+//! reports a genuine, independently-correct real router selection for
+//! EVERY layer in such a range (`router_selection`'s per-layer shape
+//! above). This engine, however, still only externally dispatches the
+//! RANGE's LAST layer's selection (`handle_expert_group_result` reads
+//! `.last()`) — `ExpertDispatcher::dispatch_and_join` keys a dispatch by
+//! the whole `(layer_start, layer_end)` range, not by an absolute layer
+//! index within it, so there is no way yet to fan out an INTERIOR layer's
+//! experts to separate machines and feed their combined result back to the
+//! SAME primary before it continues to the next layer within the range —
+//! that would need a genuinely new intermediate `PipelineState` (something
+//! like "mid-range, at layer offset K of N, holding this intermediate
+//! combined hidden state", not just today's single `pos`/`current_input`)
+//! plus per-layer dispatch keys, a real redesign left for a follow-up
+//! session (see this crate's D2 session report for the full punch list).
+//! Interior layers' selections are consequently accepted, bounds-checked,
+//! and available for a future Auditor sub-check (i) replay, but NOT (yet)
+//! turned into real network dispatch — this is a documented, honest
+//! stopping point, not a silent one: it does not change behavior for the
+//! single-layer-range case (`.last()` is the ONLY entry then, same as
+//! before this session), and it never silently drops or misattributes an
+//! interior layer's real data.
+//!
+//! A second, narrower gap, unchanged from before: the LAST dense shard of a
+//! MoE pipeline can also have a registered EXPERT group (every layer range
+//! gets one when `numExperts > 0`), but there is no wire mechanism yet for
+//! routing a combined MoE output into a final norm+lm_head/next-token
+//! decode step — `handle_shard_result_inner` logs that case too and simply
+//! falls back to the primary's own reported `next_token_id`, unchanged,
+//! same as a non-expert-routed model.
 //!
 //! Scope note (Sessão 3, deliberate): pipeline state below is in-memory
 //! only (`DashMap`), not persisted — a bridge restart loses in-flight shard
@@ -619,8 +644,9 @@ impl ShardEngine {
     /// registered EXPERT group — the MoE counterpart of the plain
     /// dense-to-dense handoff `handle_shard_result_inner` otherwise does
     /// directly. `expert_ids` is the full set of experts registered for
-    /// this range in the Model Execution Graph (NOT the active subset — see
-    /// this file's module doc, `TODO(D2-ROUTER-SELECTION)`).
+    /// this range in the Model Execution Graph (NOT the active subset for
+    /// any one layer — every layer in the range shares the same registered
+    /// candidate set, see cloudservice's `BuildModelExecutionGraph`).
     ///
     /// Fans the ACTIVE subset out through `ExpertDispatcher::
     /// dispatch_and_join` and feeds the router-weighted-combined output
@@ -629,6 +655,24 @@ impl ShardEngine {
     /// `handle_shard_result_inner`'s own dense-to-dense handoff already
     /// uses, just with the combined expert output standing in for a plain
     /// shard's `result.output`.
+    ///
+    /// D2 multi-layer follow-up (2026-07-26, later session):
+    /// `router_selection` is now `Vec<Vec<RouterExpertChoice>>`, one entry
+    /// per LAYER within the range (see `wire.rs`'s doc comment for the full
+    /// shape rationale — mirrors `pinned_expert_ids`'s convention). This
+    /// method validates and bounds-checks EVERY layer's entry (real,
+    /// genuine data for all of them — see cs-miner's
+    /// `route_only_over_range` doc for why), but still only externally
+    /// dispatches the RANGE's LAST layer's selection (`selections.last()`)
+    /// — `ExpertDispatcher`/`PipelineState` don't yet key a dispatch by
+    /// absolute layer index within a range, only by the range's own
+    /// `(layer_start, layer_end)` bounds, so there's no consumer yet for an
+    /// INTERIOR layer's selection to be turned into real network dispatch
+    /// (see this file's module doc for the full derivation — a documented,
+    /// honest stopping point, not a silent gap). For a single-layer range
+    /// (`layer_end == layer_start + 1`, the common case today) `.last()` is
+    /// the ONLY entry, so this is byte-for-byte the same behavior this
+    /// method always had.
     async fn handle_expert_group_result(
         &self,
         request_id: &str,
@@ -636,48 +680,68 @@ impl ShardEngine {
         expert_ids: Vec<u32>,
         result: &crate::opoi::wire::OpoiShardResult,
     ) -> Result<(), crate::error::AppError> {
-        // TODO(D2-ROUTER-SELECTION): `router_selection` is the seam meant to
-        // carry the PRIMARY miner's real per-token router choice back to
-        // this bridge (see `OpoiShardResult::router_selection`'s doc
-        // comment and this file's module doc) — no shipped cs-miner build
-        // populates it yet. Without it there is no sound way to know which
-        // of `expert_ids` are actually active for this token, so — same
+        // `router_selection` is the seam that carries the PRIMARY miner's
+        // real per-layer router choice back to this bridge (see
+        // `OpoiShardResult::router_selection`'s doc comment and this file's
+        // module doc). Without it there is no sound way to know which of
+        // `expert_ids` are actually active for this token, so — same
         // "stalls here until a retry mechanism exists" acceptance this file
         // already documents for submit failures — this pipeline simply
         // stalls at this step rather than guessing (e.g. dispatching ALL
         // registered experts with equal weight would silently compute a
         // mathematically different result than the real forward pass would
         // have produced, which is worse than stalling).
-        let Some(selections) = result.router_selection.as_ref() else {
+        let Some(per_layer_selections) = result.router_selection.as_ref() else {
             tracing::warn!(
                 request_id = %request_id, shard_index = result.shard_index, registered_experts = expert_ids.len(),
-                "TODO(D2-ROUTER-SELECTION): this shard's layer range has registered EXPERT nodes but the shard result carried no \
-                 router_selection — no shipped cs-miner build populates this field yet (it would require dense-shard compute to run \
-                 router-only, not full FFN, for an EXPERT-graph layer range, and report back which experts + weights the real router \
-                 picked). MoE distributed dispatch cannot proceed without it; pipeline stalls here until that lands."
+                "this shard's layer range has registered EXPERT nodes but the shard result carried no router_selection — \
+                 MoE distributed dispatch cannot proceed without it; pipeline stalls here until a retry/reassignment happens."
             );
             return Ok(());
         };
 
-        if selections.is_empty() {
-            tracing::error!(request_id = %request_id, "router_selection was present but empty — dropping pipeline");
+        if per_layer_selections.is_empty() || per_layer_selections.iter().any(|layer_sel| layer_sel.is_empty()) {
+            tracing::error!(request_id = %request_id, "router_selection was present but empty (or had an empty layer entry) — dropping pipeline");
             self.pipelines.remove(request_id);
             return Ok(());
         }
-        // Defensive bounds check — belt-and-suspenders mirror of the
-        // daemon's own consensus-side `IsExpertShardWithinManifestBounds`
-        // (cloudservice's opoi_shard.h): never dispatch real network work
-        // for an expert_id this range didn't actually register.
-        for sel in selections {
-            if !expert_ids.contains(&sel.expert_id) {
-                tracing::error!(
-                    request_id = %request_id, expert_id = sel.expert_id,
-                    "router_selection names an expert_id not registered for this layer range in the Model Execution Graph — dropping pipeline"
-                );
-                self.pipelines.remove(request_id);
-                return Ok(());
+        // Defensive bounds check, EVERY layer's entries — belt-and-
+        // suspenders mirror of the daemon's own consensus-side
+        // `IsExpertShardWithinManifestBounds` (cloudservice's
+        // opoi_shard.h): never dispatch real network work for an
+        // expert_id this range didn't actually register, at ANY layer.
+        for layer_sel in per_layer_selections {
+            for sel in layer_sel {
+                if !expert_ids.contains(&sel.expert_id) {
+                    tracing::error!(
+                        request_id = %request_id, expert_id = sel.expert_id,
+                        "router_selection names an expert_id not registered for this layer range in the Model Execution Graph — dropping pipeline"
+                    );
+                    self.pipelines.remove(request_id);
+                    return Ok(());
+                }
             }
         }
+
+        if per_layer_selections.len() > 1 {
+            // Interior layers: genuine, real, bounds-checked router data —
+            // recorded (for now, just logged) for a future Auditor
+            // sub-check (i) replay, NOT yet turned into external dispatch
+            // (see this method's doc comment and this file's module doc
+            // for exactly why, and what a follow-up would need to change).
+            tracing::info!(
+                request_id = %request_id, shard_index = result.shard_index, interior_layers = per_layer_selections.len() - 1,
+                "D2: multi-layer range — {} interior layer(s)' real router selections received and validated, but not yet \
+                 externally dispatched (still local-combine only on the primary) — only the range's last layer is dispatched below",
+                per_layer_selections.len() - 1
+            );
+        }
+
+        // Only the range's LAST layer's selection is actually turned into
+        // external per-expert dispatch today — see this method's doc
+        // comment. For a single-layer range this is the only entry, so
+        // behavior is unchanged from before this session.
+        let selections = per_layer_selections.last().expect("checked non-empty above");
 
         let Ok(input_values) = hex_to_f32(&result.output.data_hex) else {
             tracing::error!(request_id = %request_id, "shard result output data_hex failed to decode as an f32 tensor — dropping pipeline");
@@ -1384,7 +1448,10 @@ mod d2_expert_group_dispatch_tests {
             output: ShardOutputWire { shape: vec![2], data_hex: f32_to_hex(&[1.0, 2.0]) },
             next_token_id: None,
             next_token_ids: None,
-            router_selection: Some(vec![RouterExpertChoice { expert_id: 0, weight: 0.5 }, RouterExpertChoice { expert_id: 1, weight: 0.5 }]),
+            // Single-layer range [0,4) -> exactly one outer entry, same
+            // "range of length 1" degenerate case cs-miner's
+            // route_only_over_range/route_only_at_layer proves agree.
+            router_selection: Some(vec![vec![RouterExpertChoice { expert_id: 0, weight: 0.5 }, RouterExpertChoice { expert_id: 1, weight: 0.5 }]]),
         };
 
         let handle = tokio::spawn({
@@ -1435,6 +1502,174 @@ mod d2_expert_group_dispatch_tests {
         // The NEXT dense shard was actually dispatched to "next-hop-miner".
         let next_line = rx_next.recv().await.expect("next-hop-miner got the next dense-shard assignment");
         assert!(next_line.contains("opoi.shard_assign"));
+    }
+
+    /// D2 multi-layer follow-up (2026-07-26, later session): proves this
+    /// engine correctly consumes a genuine 2-layer-range `router_selection`
+    /// (`Vec<Vec<RouterExpertChoice>>` with TWO entries, mirroring what
+    /// cs-miner's `route_only_over_range` reports for a real 2-layer
+    /// dense-boundary range) — validates AND accepts BOTH layers' entries
+    /// (bounds-checked against `expert_ids`), but only turns the RANGE's
+    /// LAST layer's selection into an actual `opoi.expert_assign` fan-out,
+    /// exactly as `handle_expert_group_result`'s doc comment documents.
+    /// The interior layer's (deliberately different, distinguishable)
+    /// weights must NOT influence the combined output at all — proves this
+    /// engine isn't accidentally averaging/blending across layers.
+    #[tokio::test]
+    async fn moe_multi_layer_range_dispatches_only_last_layer_selection() {
+        let registry = Arc::new(MinerRegistry::new());
+        let (tx_next, mut rx_next) = tokio::sync::mpsc::unbounded_channel();
+        registry.register("next-hop-miner".to_string(), tx_next);
+        let (tx_a, mut rx_a) = tokio::sync::mpsc::unbounded_channel();
+        let (tx_b, mut rx_b) = tokio::sync::mpsc::unbounded_channel();
+        registry.register("expert-a".to_string(), tx_a);
+        registry.register("expert-b".to_string(), tx_b);
+        registry.mark_expert_capable("expert-a", 24_000);
+        registry.mark_expert_capable("expert-b", 24_000);
+
+        let expert_dispatcher = Arc::new(ExpertDispatcher::new(registry.clone()));
+        let engine = Arc::new(test_engine(registry.clone(), "model-x", expert_dispatcher.clone()));
+        *engine.last_assigned.lock() = Some("expert-b".to_string());
+
+        let mut expert_groups = HashMap::new();
+        expert_groups.insert((0u32, 4u32), vec![0u32, 1u32]);
+
+        engine.pipelines.insert(
+            "req-multi".to_string(),
+            PipelineState {
+                shards: vec![dense(0, 0, 4), dense(1, 4, 8)],
+                manifest: test_manifest("model-x"),
+                prompt_hash: "ph".to_string(),
+                max_tokens: 4,
+                pos: 0,
+                token_index: 0,
+                current_input: ShardInputWire::Prompt { prompt_hex: "aa".to_string() },
+                original_prompt_hex: "aa".to_string(),
+                generated_token_ids: Vec::new(),
+                contributions: std::collections::BTreeMap::new(),
+                expert_groups,
+            },
+        );
+        engine.assignments.insert("req-multi".to_string(), ShardAssignment { wallet: "primary-miner".to_string(), shard_index: 0, token_index: 0 });
+
+        let result = OpoiShardResult {
+            request_id: "req-multi".to_string(),
+            shard_index: 0,
+            token_index: 0,
+            output_hash: "irrelevant-for-this-test".to_string(),
+            output: ShardOutputWire { shape: vec![2], data_hex: f32_to_hex(&[1.0, 2.0]) },
+            next_token_id: None,
+            next_token_ids: None,
+            // TWO layers in this range: offset 0 (the interior layer, real
+            // data but NOT dispatched — deliberately lopsided weights, 0.9/0.1,
+            // that would produce a very different combine than offset 1's
+            // 0.5/0.5 if this engine ever mistakenly used them) and offset 1
+            // (the boundary layer — the ONLY one actually dispatched below).
+            router_selection: Some(vec![
+                vec![RouterExpertChoice { expert_id: 0, weight: 0.9 }, RouterExpertChoice { expert_id: 1, weight: 0.1 }],
+                vec![RouterExpertChoice { expert_id: 0, weight: 0.5 }, RouterExpertChoice { expert_id: 1, weight: 0.5 }],
+            ]),
+        };
+
+        let handle = tokio::spawn({
+            let engine = engine.clone();
+            async move { engine.handle_shard_result_inner("primary-miner", result).await }
+        });
+
+        let line_a = rx_a.recv().await.expect("expert-a got a line");
+        let line_b = rx_b.recv().await.expect("expert-b got a line");
+        assert!(line_a.contains("opoi.expert_assign"));
+        assert!(line_b.contains("opoi.expert_assign"));
+
+        for (expert_id, wallet, value) in [(0u32, "expert-a", 10.0f32), (1u32, "expert-b", 20.0f32)] {
+            let reply = OpoiExpertResult {
+                request_id: "req-multi".to_string(),
+                layer_start: 0,
+                layer_end: 4,
+                expert_id,
+                token_index: 0,
+                output_hash: String::new(),
+                output: ExpertOutputWire { shape: vec![2], data_hex: f32_to_hex(&[value, value]) },
+            };
+            expert_dispatcher.handle_expert_result(wallet, reply).await.expect("reply accepted");
+        }
+
+        handle.await.expect("task join").expect("handle_shard_result_inner ok");
+
+        {
+            let pipeline = engine.pipelines.get("req-multi").expect("pipeline still in flight (not the last shard)");
+            assert_eq!(pipeline.pos, 1);
+            match &pipeline.current_input {
+                ShardInputWire::Tensor { shape, data_hex } => {
+                    assert_eq!(*shape, vec![2]);
+                    let combined = hex_to_f32(data_hex).unwrap();
+                    // Must reflect the BOUNDARY layer's 0.5/0.5 weights
+                    // (0.5*10 + 0.5*20 = 15.0), NOT the interior layer's
+                    // 0.9/0.1 (which would give 0.9*10 + 0.1*20 = 11.0).
+                    assert!((combined[0] - 15.0).abs() < 1e-5, "expected boundary-layer weights to be used, got {combined:?}");
+                    assert!((combined[1] - 15.0).abs() < 1e-5, "expected boundary-layer weights to be used, got {combined:?}");
+                }
+                other => panic!("expected ShardInputWire::Tensor, got {other:?}"),
+            }
+        }
+
+        let next_line = rx_next.recv().await.expect("next-hop-miner got the next dense-shard assignment");
+        assert!(next_line.contains("opoi.shard_assign"));
+    }
+
+    /// The interior layer's `expert_id` gets bounds-checked too, even though
+    /// it isn't dispatched — a malformed/dishonest interior entry must still
+    /// drop the pipeline rather than be silently ignored just because it's
+    /// not the layer this engine currently acts on.
+    #[tokio::test]
+    async fn moe_multi_layer_range_rejects_out_of_range_expert_id_even_in_an_interior_layer() {
+        let registry = Arc::new(MinerRegistry::new());
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        registry.register("primary-miner".to_string(), tx);
+
+        let expert_dispatcher = Arc::new(ExpertDispatcher::new(registry.clone()));
+        let engine = test_engine(registry.clone(), "model-x", expert_dispatcher);
+
+        let mut expert_groups = HashMap::new();
+        expert_groups.insert((0u32, 4u32), vec![0u32, 1u32]);
+
+        engine.pipelines.insert(
+            "req-bad-interior".to_string(),
+            PipelineState {
+                shards: vec![dense(0, 0, 4), dense(1, 4, 8)],
+                manifest: test_manifest("model-x"),
+                prompt_hash: "ph".to_string(),
+                max_tokens: 4,
+                pos: 0,
+                token_index: 0,
+                current_input: ShardInputWire::Prompt { prompt_hex: "aa".to_string() },
+                original_prompt_hex: "aa".to_string(),
+                generated_token_ids: Vec::new(),
+                contributions: std::collections::BTreeMap::new(),
+                expert_groups,
+            },
+        );
+        engine.assignments.insert("req-bad-interior".to_string(), ShardAssignment { wallet: "primary-miner".to_string(), shard_index: 0, token_index: 0 });
+
+        let result = OpoiShardResult {
+            request_id: "req-bad-interior".to_string(),
+            shard_index: 0,
+            token_index: 0,
+            output_hash: "irrelevant-for-this-test".to_string(),
+            output: ShardOutputWire { shape: vec![2], data_hex: f32_to_hex(&[1.0, 2.0]) },
+            next_token_id: None,
+            next_token_ids: None,
+            router_selection: Some(vec![
+                // Interior layer names expert_id 99 -- never registered for
+                // this range.
+                vec![RouterExpertChoice { expert_id: 99, weight: 1.0 }],
+                vec![RouterExpertChoice { expert_id: 0, weight: 0.5 }, RouterExpertChoice { expert_id: 1, weight: 0.5 }],
+            ]),
+        };
+
+        engine.handle_shard_result_inner("primary-miner", result).await.expect("dropping is not an error");
+
+        assert!(engine.pipelines.get("req-bad-interior").is_none(), "pipeline must be dropped, not silently advanced");
     }
 
     /// TODO(D2-ROUTER-SELECTION) coverage: when the shard result carries no

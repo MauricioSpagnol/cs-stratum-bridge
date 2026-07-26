@@ -66,18 +66,21 @@
 //!
 //! ## Layer-range granularity
 //!
-//! Today `BuildModelExecutionGraph` collapses every MoE manifest into ONE
-//! dense shard spanning the WHOLE model (`layer_start=0..num_layers` — see
-//! `shard_engine.rs`'s module doc), so a single `handle_expert_group_result`
-//! call's `(layer_start, layer_end)` range may span every real GGUF `blk.N`
-//! at once, not just one. `min_vram_mb_for_range` handles both that case AND
-//! a future single-layer range (once real per-layer routing lands, see
-//! `TODO(D2-ROUTER-SELECTION)`) uniformly: it takes the MAX per-expert byte
-//! size over every `blk.N` in `[layer_start, layer_end)` — a safe
-//! (conservative, never an under-estimate) floor either way, and exactly
-//! right in the common case that every layer's experts are the same size
-//! (true for every standard llama.cpp MoE GGUF layout: `ffn_*_exps.weight`
-//! tensors don't vary shape/dtype across layers).
+//! A MoE manifest's dense-boundary `(layer_start, layer_end)` range CAN
+//! legally span more than one real GGUF `blk.N` (cloudservice's
+//! `SplitLayerRanges` is a plain even split, not required to equal
+//! `num_layers` many ranges — see `shard_engine.rs`'s module doc and
+//! cs-miner's D2 session report for the full derivation), so a single
+//! `handle_expert_group_result` call's range may span several layers at
+//! once, not just one — even though (2026-07-26 multi-layer follow-up
+//! session) that call currently only externally dispatches the range's
+//! LAST layer's selection. `min_vram_mb_for_range` handles any range width
+//! uniformly regardless: it takes the MAX per-expert byte size over every
+//! `blk.N` in `[layer_start, layer_end)` — a safe (conservative, never an
+//! under-estimate) floor either way, and exactly right in the common case
+//! that every layer's experts are the same size (true for every standard
+//! llama.cpp MoE GGUF layout: `ffn_*_exps.weight` tensors don't vary
+//! shape/dtype across layers).
 
 use std::collections::HashMap;
 use std::io::{Cursor, Read};
