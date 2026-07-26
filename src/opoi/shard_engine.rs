@@ -88,6 +88,7 @@ use crate::miner_registry::MinerRegistry;
 use crate::opoi::b3lite::{self, B3LiteConfig};
 use crate::opoi::engine::do_commit;
 use crate::opoi::expert_dispatch::{hex_to_f32, ExpertDispatcher, SelectedExpert};
+use crate::opoi::expert_vram::ExpertVramEstimator;
 use crate::opoi::speculative_engine::SpeculativeEngine;
 use crate::opoi::wire::{build_shard_assign_line, OpoiShardAssign, ShardInputWire, ShardOutputWire};
 use crate::rpc::types::{ModelGraph, ModelManifest, ShardDescriptor};
@@ -257,6 +258,13 @@ pub struct ShardEngine {
     /// `dispatch_and_join` call this engine makes in
     /// `handle_expert_group_result` below.
     expert_dispatcher: Arc<ExpertDispatcher>,
+    /// D2 follow-up: real per-expert VRAM sizing for `dispatch_and_join`'s
+    /// `min_vram_mb_for` callback — see `expert_vram.rs`'s module doc for
+    /// the full mechanism (GGUF-header-only HTTP read, no shared state with
+    /// anything else, so this is simply self-constructed in `new` rather
+    /// than threaded through every call site the way `expert_dispatcher`
+    /// must be).
+    expert_vram: ExpertVramEstimator,
 }
 
 impl ShardEngine {
@@ -278,6 +286,7 @@ impl ShardEngine {
             speculative,
             b3lite,
             expert_dispatcher,
+            expert_vram: ExpertVramEstimator::new(),
         }
     }
 
@@ -688,15 +697,25 @@ impl ShardEngine {
             .map(|sel| SelectedExpert { expert_id: sel.expert_id, weight: sel.weight, shape: result.output.shape.clone(), data: input_values.clone() })
             .collect();
 
-        // D2: real per-expert VRAM sizing (`min_vram_mb_for`) isn't threaded
-        // through to this layer yet — same TODO `MinerRegistry::
-        // pick_expert_hosts_top_n` already documents (GGUF/manifest expert
-        // size metadata isn't available here). `0` (no floor) matches
-        // `expert_dispatch.rs`'s own unit tests' convention for the same
-        // reason.
+        // D2 follow-up: real per-expert VRAM floor, read straight from the
+        // GGUF's own header (see `expert_vram.rs`'s module doc for the full
+        // mechanism/rationale) — every expert of a given layer shares the
+        // same FFN-expert tensor shape/dtype (see that module's doc comment
+        // for why `min_vram_mb_for` below can safely ignore its `expert_id`
+        // argument), so this is resolved to a single `u64` up front rather
+        // than varying per expert. `unwrap_or(0)` on failure (network error,
+        // header not parseable, unsupported dtype, ...) falls back to the
+        // pre-follow-up behavior — no floor at all — rather than stalling
+        // the whole MoE dispatch over an unavailable VRAM estimate.
+        let min_vram_mb = self
+            .expert_vram
+            .min_vram_mb_for_range(&model_id, &source.gguf_url, &gguf_sha256, layer_start, layer_end, expert_ids.len() as u64)
+            .await
+            .unwrap_or(0);
+
         let combined = self
             .expert_dispatcher
-            .dispatch_and_join(request_id, layer_start, layer_end, token_index, &model_id, &source.gguf_url, &gguf_sha256, experts, |_expert_id| 0u64)
+            .dispatch_and_join(request_id, layer_start, layer_end, token_index, &model_id, &source.gguf_url, &gguf_sha256, experts, move |_expert_id| min_vram_mb)
             .await;
 
         match combined {

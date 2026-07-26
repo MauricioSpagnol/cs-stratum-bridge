@@ -253,15 +253,18 @@ impl MinerRegistry {
     /// same expert to different hosts, per the D2 scope doc). `pick_expert_host`
     /// is simply `n == 1`.
     ///
-    /// TODO(D2): `min_vram_mb` should come from the actual weight-slice
-    /// size of the specific expert being dispatched, read from the GGUF/
-    /// manifest metadata (`getmodelmanifest`'s `expert_pom_roots` or
-    /// similar — see `ModelManifest`'s doc comment in `rpc/types.rs`,
-    /// which today only parses `arch_type`/`num_layers`/`backbone_pom_root`/
-    /// `status` and explicitly ignores the rest). That metadata isn't
-    /// threaded through to this layer yet, so every caller of this method
-    /// must pass an explicit `min_vram_mb` of its own choosing for now —
-    /// this method does not invent or default one.
+    /// D2 follow-up (2026-07-26, resolved): `min_vram_mb` now comes from the
+    /// actual weight-slice size of the specific expert(s) being dispatched
+    /// — `opoi/expert_vram.rs::ExpertVramEstimator` reads it straight out of
+    /// the GGUF file's own header (a small, cached HTTP prefix read; see
+    /// that module's doc comment for why this reads the GGUF directly
+    /// rather than `getmodelmanifest`, which carries no reliable per-expert
+    /// size field). `shard_engine.rs::handle_expert_group_result` is the one
+    /// production call site and resolves this before calling
+    /// `pick_expert_host`/`pick_expert_hosts_top_n`; this method itself
+    /// still does not invent or default a value — an explicit `min_vram_mb`
+    /// (possibly `0`, if the estimator couldn't determine one) is always
+    /// the caller's responsibility.
     pub fn pick_expert_hosts_top_n(&self, min_vram_mb: u64, exclude_wallets: &[String], n: usize) -> Vec<String> {
         if n == 0 {
             return Vec::new();
