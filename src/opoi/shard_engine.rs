@@ -260,6 +260,92 @@ struct PipelineState {
     /// handoff clear it) so the next shard's dispatch decision is made
     /// fresh, not inherited from the shard that just finished.
     moe_layer_walk: Option<(u32, String)>,
+    /// D2 live-topology follow-up (2026-07-26): every dense/primary dispatch
+    /// this pipeline has actually sent, in order — one entry per real
+    /// `opoi.shard_assign` `dispatch_current` transmits (including each
+    /// layer step of a multi-layer walk, and re-dispatches after a stall/
+    /// disconnect, which simply appear as a later entry for the same
+    /// `shard_index`). Never trimmed — a live report needs the WHOLE
+    /// request's history, not just the current step (see
+    /// `ShardEngine::topology_snapshot`); a real request's shard count is
+    /// small enough (tens, not thousands) that this is cheap to keep for a
+    /// whole pipeline's lifetime.
+    dispatch_log: Vec<PrimaryDispatchRecord>,
+}
+
+/// One real `opoi.shard_assign` `dispatch_current` sent — see
+/// `PipelineState::dispatch_log`'s doc comment.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct PrimaryDispatchRecord {
+    pub shard_index: u32,
+    pub layer_start: u32,
+    pub layer_end: u32,
+    pub moe_layer_step: Option<u32>,
+    pub wallet: String,
+    pub token_index: u32,
+}
+
+/// D2 live-topology follow-up (2026-07-26) — see
+/// `ShardEngine::topology_snapshot`'s doc comment for the full rationale.
+/// One request's whole "how many parts, which GPU/wallet is running each"
+/// picture, matching either reference diagram this was scoped against: a
+/// pure-DENSE model's `parts` are all `kind: "dense"`, one per shard, in a
+/// chain (diagram 1's "cadeia de GPUs"); a MoE model's `parts` alternates
+/// `"dense"` (the backbone/router step for that layer range) and
+/// `"expert_group"` (that same range's registered experts — diagram 2's
+/// "backbone + experts", `experts[].activated` is the "espessura da
+/// linha" signal: only experts this process actually dispatched at least
+/// once are `activated: true`, the rest are registered-but-never-chosen
+/// for this request so far).
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct TopologySnapshot {
+    pub request_id: String,
+    pub model_id: String,
+    pub arch_type: String,
+    pub num_layers: u32,
+    /// Index into `parts`' dense entries — which one is CURRENTLY being
+    /// computed (see each `TopologyPart::status`).
+    pub current_pos: usize,
+    pub current_token_index: u32,
+    pub parts: Vec<TopologyPart>,
+    /// Every wallet currently connected to this bridge, whether or not it
+    /// has anything to do with THIS request — the full "which GPUs exist
+    /// right now" roster a live report wants alongside "which part is each
+    /// one running".
+    pub connected_miners: Vec<crate::miner_registry::MinerSnapshot>,
+}
+
+/// One part of a request's model execution graph — either a `"dense"`
+/// shard (a layer range's attention+norm+router, run by exactly one
+/// `primary_wallet`) or an `"expert_group"` (that SAME layer range's
+/// registered experts, run by up to one wallet each) — see
+/// `TopologySnapshot`'s doc comment.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct TopologyPart {
+    pub kind: String,
+    pub shard_index: u32,
+    pub layer_start: u32,
+    pub layer_end: u32,
+    /// `"done"` | `"current"` | `"pending"` — relative to the pipeline's
+    /// `pos` (the SAME status applies to a shard's `"dense"` part and its
+    /// paired `"expert_group"` part, since they're the same layer range).
+    pub status: String,
+    /// Only meaningful for `kind == "dense"` — `None` until this shard has
+    /// actually been dispatched at least once.
+    pub primary_wallet: Option<String>,
+    pub primary_vram_mb: Option<u64>,
+    /// Only non-empty for `kind == "expert_group"`.
+    pub experts: Vec<TopologyExpert>,
+}
+
+/// One expert registered for a `TopologyPart`'s layer range — see
+/// `TopologySnapshot`'s doc comment for `activated`'s meaning.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct TopologyExpert {
+    pub expert_id: u32,
+    pub wallet: Option<String>,
+    pub vram_mb: Option<u64>,
+    pub activated: bool,
 }
 
 impl PipelineState {
@@ -371,6 +457,92 @@ impl ShardEngine {
         self.prompt_cache.insert(request_id.to_string(), prompt_hex);
     }
 
+    /// D2 live-topology follow-up (2026-07-26): a read-only snapshot of
+    /// "how many parts was this request's model split into, and which
+    /// wallet (GPU) is/was computing each one" — the data a live audit/
+    /// report view needs (see the two reference diagrams this was scoped
+    /// against: a dense pipeline-parallel chain of GPUs, or a MoE
+    /// backbone + per-expert GPUs with per-token activation). This is the
+    /// ONLY place this state exists: cs-miner never talks to the chain
+    /// daemon directly, and the daemon itself only ever sees a request's
+    /// on-chain SUBMITTED shard results, never which live connection is
+    /// currently computing what — that only ever lives in THIS process's
+    /// memory (`PipelineState`/`MinerRegistry`/`ExpertDispatcher`).
+    ///
+    /// `None` if `request_id` has no pipeline here right now (never
+    /// started, already finalized and removed, or dropped) — same
+    /// "unknown request" shape every other read-only accessor in this
+    /// file already uses instead of a fabricated empty response.
+    pub fn topology_snapshot(&self, request_id: &str) -> Option<TopologySnapshot> {
+        let pipeline = self.pipelines.get(request_id)?;
+        let connected_miners = self.registry.snapshot_all();
+        let vram_by_wallet: std::collections::HashMap<String, u64> =
+            connected_miners.iter().filter_map(|m| m.expert_vram_mb.map(|v| (m.wallet.clone(), v))).collect();
+
+        let mut parts = Vec::with_capacity(pipeline.shards.len() * 2);
+        for (idx, shard) in pipeline.shards.iter().enumerate() {
+            let layer_start = shard.layer_start.unwrap_or(0);
+            let layer_end = shard.layer_end.unwrap_or(0);
+            let status = if idx < pipeline.pos { "done" } else if idx == pipeline.pos { "current" } else { "pending" };
+
+            // Most recent dense/primary dispatch logged for this shard —
+            // every layer step of a multi-layer walk pins the SAME wallet
+            // (see `PipelineState::moe_layer_walk`'s doc), so the LAST
+            // entry for this shard_index is always the right one to show,
+            // whether the walk is done, in flight, or was re-dispatched
+            // after a stall.
+            let primary = pipeline.dispatch_log.iter().rev().find(|r| r.shard_index == shard.shard_index);
+            let primary_wallet = primary.map(|r| r.wallet.clone());
+            let primary_vram_mb = primary_wallet.as_ref().and_then(|w| vram_by_wallet.get(w).copied());
+
+            parts.push(TopologyPart {
+                kind: "dense".to_string(),
+                shard_index: shard.shard_index,
+                layer_start,
+                layer_end,
+                status: status.to_string(),
+                primary_wallet,
+                primary_vram_mb,
+                experts: Vec::new(),
+            });
+
+            if let Some(registered) = pipeline.expert_groups.get(&(layer_start, layer_end)).filter(|ids| !ids.is_empty()) {
+                let recent = self.expert_dispatcher.recent_assignments_for_range(request_id, layer_start, layer_end);
+                let recent_by_id: std::collections::HashMap<u32, String> = recent.into_iter().collect();
+                let experts = registered
+                    .iter()
+                    .map(|&expert_id| {
+                        let wallet = recent_by_id.get(&expert_id).cloned();
+                        let vram_mb = wallet.as_ref().and_then(|w| vram_by_wallet.get(w).copied());
+                        let activated = wallet.is_some();
+                        TopologyExpert { expert_id, wallet, vram_mb, activated }
+                    })
+                    .collect();
+                parts.push(TopologyPart {
+                    kind: "expert_group".to_string(),
+                    shard_index: shard.shard_index,
+                    layer_start,
+                    layer_end,
+                    status: status.to_string(),
+                    primary_wallet: None,
+                    primary_vram_mb: None,
+                    experts,
+                });
+            }
+        }
+
+        Some(TopologySnapshot {
+            request_id: request_id.to_string(),
+            model_id: pipeline.manifest.model_id.clone(),
+            arch_type: pipeline.manifest.arch_type.clone(),
+            num_layers: pipeline.manifest.num_layers,
+            current_pos: pipeline.pos,
+            current_token_index: pipeline.token_index,
+            parts,
+            connected_miners,
+        })
+    }
+
     /// Returns `true` if `model_id` resolves to an ACTIVE manifest — the
     /// exact check `OpoiEngine::poll_and_assign_tick` uses to decide whether
     /// a PENDING request belongs to this engine instead.
@@ -470,6 +642,7 @@ impl ShardEngine {
                     contributions: BTreeMap::new(),
                     expert_groups,
                     moe_layer_walk: None,
+                    dispatch_log: Vec::new(),
                 },
             );
             self.prompt_cache.remove(&req.request_id);
@@ -613,6 +786,18 @@ impl ShardEngine {
             request_id.to_string(),
             ShardAssignment { wallet: wallet.clone(), shard_index: snap.shard_index, token_index: snap.token_index, moe_layer_step },
         );
+        // D2 live-topology follow-up: record this send in the pipeline's
+        // own history — see `PipelineState::dispatch_log`'s doc comment.
+        if let Some(mut pipeline) = self.pipelines.get_mut(request_id) {
+            pipeline.dispatch_log.push(PrimaryDispatchRecord {
+                shard_index: snap.shard_index,
+                layer_start: snap.layer_start,
+                layer_end: snap.layer_end,
+                moe_layer_step,
+                wallet: wallet.clone(),
+                token_index: snap.token_index,
+            });
+        }
         let _ = tx.send(build_shard_assign_line(&assign));
         tracing::info!(
             request_id = %request_id, shard_index = snap.shard_index, token_index = snap.token_index, wallet = %wallet, ?moe_layer_step,
@@ -1684,6 +1869,7 @@ mod tests {
             contributions: BTreeMap::new(),
             expert_groups,
             moe_layer_walk: None,
+                    dispatch_log: Vec::new(),
         }
     }
 
@@ -1738,9 +1924,9 @@ mod d2_expert_group_dispatch_tests {
     use std::collections::HashMap;
     use std::sync::Arc;
 
-    use super::{ModelSource, ModelSourceConfig, PipelineState, ShardAssignment, ShardEngine};
+    use super::{ModelSource, ModelSourceConfig, PipelineState, PrimaryDispatchRecord, ShardAssignment, ShardEngine};
     use crate::miner_registry::MinerRegistry;
-    use crate::opoi::expert_dispatch::{hex_to_f32, ExpertDispatcher};
+    use crate::opoi::expert_dispatch::{hex_to_f32, ExpertDispatcher, SelectedExpert};
     use crate::opoi::handler::ExpertHandler;
     use crate::opoi::wire::{ExpertOutputWire, OpoiExpertResult, OpoiShardResult, RouterExpertChoice, ShardInputWire, ShardOutputWire};
     use crate::rpc::types::{ModelManifest, ShardDescriptor};
@@ -1826,6 +2012,7 @@ mod d2_expert_group_dispatch_tests {
                 contributions: std::collections::BTreeMap::new(),
                 expert_groups,
                 moe_layer_walk: None,
+                    dispatch_log: Vec::new(),
             },
         );
         engine.assignments.insert("req-1".to_string(), ShardAssignment { wallet: "primary-miner".to_string(), shard_index: 0, token_index: 0, moe_layer_step: None });
@@ -1941,6 +2128,7 @@ mod d2_expert_group_dispatch_tests {
                 contributions: std::collections::BTreeMap::new(),
                 expert_groups,
                 moe_layer_walk: None,
+                    dispatch_log: Vec::new(),
             },
         );
         engine.assignments.insert("req-multi".to_string(), ShardAssignment { wallet: "primary-miner".to_string(), shard_index: 0, token_index: 0, moe_layer_step: None });
@@ -2043,6 +2231,7 @@ mod d2_expert_group_dispatch_tests {
                 contributions: std::collections::BTreeMap::new(),
                 expert_groups,
                 moe_layer_walk: None,
+                    dispatch_log: Vec::new(),
             },
         );
         engine.assignments.insert("req-bad-interior".to_string(), ShardAssignment { wallet: "primary-miner".to_string(), shard_index: 0, token_index: 0, moe_layer_step: None });
@@ -2101,6 +2290,7 @@ mod d2_expert_group_dispatch_tests {
                 contributions: std::collections::BTreeMap::new(),
                 expert_groups,
                 moe_layer_walk: None,
+                    dispatch_log: Vec::new(),
             },
         );
         engine.assignments.insert("req-2".to_string(), ShardAssignment { wallet: "primary-miner".to_string(), shard_index: 0, token_index: 0, moe_layer_step: None });
@@ -2160,6 +2350,7 @@ mod d2_expert_group_dispatch_tests {
                 contributions: std::collections::BTreeMap::new(),
                 expert_groups,
                 moe_layer_walk: None,
+                    dispatch_log: Vec::new(),
             },
         );
         engine.assignments.insert("req-3".to_string(), ShardAssignment { wallet: "primary-miner".to_string(), shard_index: 0, token_index: 0, moe_layer_step: None });
@@ -2254,6 +2445,7 @@ mod d2_expert_group_dispatch_tests {
                 contributions: std::collections::BTreeMap::new(),
                 expert_groups,
                 moe_layer_walk: None,
+                    dispatch_log: Vec::new(),
             },
         );
 
@@ -2424,6 +2616,7 @@ mod d2_expert_group_dispatch_tests {
                 expert_groups,
                 // Mid-walk state: pinned to a wallet that is NOT connected.
                 moe_layer_walk: Some((1, "ghost-miner".to_string())),
+                dispatch_log: Vec::new(),
             },
         );
 
@@ -2439,5 +2632,143 @@ mod d2_expert_group_dispatch_tests {
             engine.pipelines.get("req-disc").is_none(),
             "pipeline must be dropped when the pinned wallet is gone, not silently resumed against a different miner"
         );
+    }
+
+    /// D2 live-topology follow-up (2026-07-26): `topology_snapshot` must
+    /// report the real shape of a MoE pipeline — dense shards in order,
+    /// each paired with its `expert_group` (every REGISTERED expert
+    /// listed, `activated` only for the ones actually dispatched at least
+    /// once), current wallet/VRAM for whichever shard just ran, and the
+    /// full connected-miner roster regardless of this request.
+    #[tokio::test]
+    async fn topology_snapshot_reports_dense_shards_and_expert_activation() {
+        let registry = Arc::new(MinerRegistry::new());
+        let (tx_primary, _rx_primary) = tokio::sync::mpsc::unbounded_channel();
+        registry.register("primary-miner".to_string(), tx_primary);
+        let (tx_a, mut rx_a) = tokio::sync::mpsc::unbounded_channel();
+        let (tx_b, mut rx_b) = tokio::sync::mpsc::unbounded_channel();
+        registry.register("expert-a".to_string(), tx_a);
+        registry.register("expert-b".to_string(), tx_b);
+        registry.mark_expert_capable("expert-a", 8_000);
+        registry.mark_expert_capable("expert-b", 16_000);
+
+        let expert_dispatcher = Arc::new(ExpertDispatcher::new(registry.clone()));
+        let engine = Arc::new(test_engine(registry.clone(), "model-x", expert_dispatcher.clone()));
+
+        let mut expert_groups = HashMap::new();
+        expert_groups.insert((0u32, 2u32), vec![0u32, 1u32, 2u32]); // 3 registered, only 2 will be dispatched
+
+        engine.pipelines.insert(
+            "req-topo".to_string(),
+            PipelineState {
+                shards: vec![dense(0, 0, 2), dense(1, 2, 4)],
+                manifest: test_manifest("model-x"),
+                prompt_hash: "ph".to_string(),
+                max_tokens: 4,
+                pos: 0,
+                token_index: 0,
+                current_input: ShardInputWire::Prompt { prompt_hex: "aa".to_string() },
+                original_prompt_hex: "aa".to_string(),
+                generated_token_ids: Vec::new(),
+                contributions: std::collections::BTreeMap::new(),
+                expert_groups,
+                moe_layer_walk: Some((0, "primary-miner".to_string())),
+                dispatch_log: vec![PrimaryDispatchRecord {
+                    shard_index: 0,
+                    layer_start: 0,
+                    layer_end: 2,
+                    moe_layer_step: Some(0),
+                    wallet: "primary-miner".to_string(),
+                    token_index: 0,
+                }],
+            },
+        );
+
+        // Real dispatch (not a fake insert) for expert_id 0 and 1 only —
+        // expert_id 2 stays registered but never dispatched.
+        let d = expert_dispatcher.clone();
+        let handle = tokio::spawn(async move {
+            d.dispatch_and_join(
+                "req-topo", 0, 2, 0, 0, "model-x", "http://gguf", "gguf-hash",
+                vec![
+                    SelectedExpert { expert_id: 0, weight: 0.5, shape: vec![1], data: vec![1.0] },
+                    SelectedExpert { expert_id: 1, weight: 0.5, shape: vec![1], data: vec![1.0] },
+                ],
+                |_expert_id| 1_000,
+                &[],
+            )
+            .await
+        });
+        let line_a = rx_a.recv().await.expect("expert-a got a line");
+        let line_b = rx_b.recv().await.expect("expert-b got a line");
+        assert!(line_a.contains("opoi.expert_assign"));
+        assert!(line_b.contains("opoi.expert_assign"));
+
+        // Don't assume which physical wallet `pick_expert_host` gave which
+        // expert_id (it orders by VRAM descending, not registration order —
+        // see `MinerRegistry::pick_expert_hosts_top_n`'s doc) — ask
+        // `recent_assignments_for_range` (the same accessor
+        // `topology_snapshot` itself uses) what really happened, and reply
+        // accordingly.
+        let real_assignments = expert_dispatcher.recent_assignments_for_range("req-topo", 0, 2);
+        assert_eq!(real_assignments.len(), 2);
+        for (expert_id, wallet) in &real_assignments {
+            let reply = OpoiExpertResult {
+                request_id: "req-topo".to_string(),
+                layer_start: 0,
+                layer_end: 2,
+                layer_idx: 0,
+                expert_id: *expert_id,
+                token_index: 0,
+                output_hash: String::new(),
+                output: ExpertOutputWire { shape: vec![1], data_hex: f32_to_hex(&[1.0]) },
+            };
+            expert_dispatcher.handle_expert_result(wallet, reply).await.expect("reply accepted");
+        }
+        handle.await.expect("task join").expect("dispatch_and_join ok");
+
+        let snapshot = engine.topology_snapshot("req-topo").expect("pipeline exists");
+        assert_eq!(snapshot.model_id, "model-x");
+        assert_eq!(snapshot.arch_type, "MOE");
+        assert_eq!(snapshot.current_pos, 0);
+
+        // shard 0's dense part: current, primary-miner, no VRAM (not expert-capable).
+        let dense0 = snapshot.parts.iter().find(|p| p.kind == "dense" && p.shard_index == 0).expect("dense part 0");
+        assert_eq!(dense0.status, "current");
+        assert_eq!(dense0.primary_wallet.as_deref(), Some("primary-miner"));
+        assert_eq!(dense0.primary_vram_mb, None);
+
+        // shard 0's expert_group: 3 registered, exactly the 2 real dispatches
+        // activated with the right wallets/VRAM, matching `real_assignments`.
+        let group0 = snapshot.parts.iter().find(|p| p.kind == "expert_group" && p.shard_index == 0).expect("expert group 0");
+        assert_eq!(group0.experts.len(), 3);
+        let expected: std::collections::HashMap<u32, String> = real_assignments.into_iter().collect();
+        for e in &group0.experts {
+            match expected.get(&e.expert_id) {
+                Some(wallet) => {
+                    assert!(e.activated, "expert_id {} was really dispatched to {wallet}, must show activated", e.expert_id);
+                    assert_eq!(e.wallet.as_deref(), Some(wallet.as_str()));
+                    let expected_vram = if wallet == "expert-a" { 8_000 } else { 16_000 };
+                    assert_eq!(e.vram_mb, Some(expected_vram));
+                }
+                None => {
+                    assert!(!e.activated, "expert_id {} was never dispatched — must NOT show as activated", e.expert_id);
+                    assert_eq!(e.wallet, None);
+                }
+            }
+        }
+
+        // shard 1 (pending, never dispatched, no expert_group registered for it).
+        let dense1 = snapshot.parts.iter().find(|p| p.kind == "dense" && p.shard_index == 1).expect("dense part 1");
+        assert_eq!(dense1.status, "pending");
+        assert_eq!(dense1.primary_wallet, None);
+        assert!(!snapshot.parts.iter().any(|p| p.kind == "expert_group" && p.shard_index == 1));
+
+        // Full connected-miner roster, regardless of this one request.
+        assert_eq!(snapshot.connected_miners.len(), 3);
+        let primary_snap = snapshot.connected_miners.iter().find(|m| m.wallet == "primary-miner").unwrap();
+        assert!(!primary_snap.expert_capable);
+
+        assert!(engine.topology_snapshot("never-existed").is_none());
     }
 }

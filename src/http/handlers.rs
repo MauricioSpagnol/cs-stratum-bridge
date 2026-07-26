@@ -69,3 +69,18 @@ pub async fn get_submission(State(state): State<AppState>, Path(request_id): Pat
 pub async fn list_pending(State(state): State<AppState>) -> impl IntoResponse {
     Json(state.engine.pending_snapshot())
 }
+
+/// D2 live-topology follow-up (2026-07-26): "how many parts was this
+/// request's model split into, and which wallet/GPU is running each one,
+/// right now" — see `ShardEngine::topology_snapshot`'s doc comment for the
+/// full rationale (this is the ONLY place this data exists at all; cs-miner
+/// never talks to the chain daemon directly, and the daemon itself only
+/// ever sees already-SUBMITTED on-chain results, never live in-flight
+/// assignment). Unauthenticated, same as `get_submission`/`list_pending`
+/// above — purely informational, read-only, no wallet/collateral action.
+pub async fn get_topology(State(state): State<AppState>, Path(request_id): Path<String>) -> impl IntoResponse {
+    match state.shard_engine.topology_snapshot(&request_id) {
+        Some(snapshot) => Json(snapshot).into_response(),
+        None => (StatusCode::NOT_FOUND, "no shard pipeline for this request_id right now").into_response(),
+    }
+}

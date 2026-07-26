@@ -57,6 +57,23 @@ pub struct MinerRegistry {
     expert_capable_vram: Mutex<HashMap<String, u64>>,
 }
 
+/// One connected miner's currently-known capability roster — the read-only
+/// view a live topology/audit report needs (see `ShardEngine::
+/// topology_snapshot`). Deliberately a snapshot copy, not a live reference:
+/// callers building a report don't need to hold any of this registry's
+/// locks while they serialize a response.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct MinerSnapshot {
+    pub wallet: String,
+    pub draft_capable: bool,
+    pub auditor_capable: bool,
+    pub expert_capable: bool,
+    /// Only `Some` when `expert_capable` — the VRAM (MB) this wallet
+    /// reported alongside its `expert` capability announcement.
+    pub expert_vram_mb: Option<u64>,
+    pub banned: bool,
+}
+
 impl MinerRegistry {
     pub fn new() -> Self {
         Self {
@@ -101,6 +118,31 @@ impl MinerRegistry {
 
     pub fn get(&self, wallet: &str) -> Option<UnboundedSender<String>> {
         self.inner.lock().get(wallet).cloned()
+    }
+
+    /// D2 live-topology follow-up (2026-07-26): every currently-connected
+    /// wallet's capability roster, insertion order — the "which GPUs/miners
+    /// exist right now" half of a live topology report (see
+    /// `ShardEngine::topology_snapshot`). Read-only; takes each lock just
+    /// long enough to copy out, same discipline every other method here
+    /// already uses.
+    pub fn snapshot_all(&self) -> Vec<MinerSnapshot> {
+        let inner = self.inner.lock();
+        let draft = self.draft_capable.lock();
+        let auditor = self.auditor_capable.lock();
+        let banned = self.banned.lock();
+        let expert_vram = self.expert_capable_vram.lock();
+        inner
+            .keys()
+            .map(|wallet| MinerSnapshot {
+                wallet: wallet.clone(),
+                draft_capable: draft.contains(wallet),
+                auditor_capable: auditor.contains(wallet),
+                expert_capable: expert_vram.contains_key(wallet),
+                expert_vram_mb: expert_vram.get(wallet).copied(),
+                banned: banned.contains(wallet),
+            })
+            .collect()
     }
 
     /// Round-robin: returns the wallet after `last` in insertion order,

@@ -128,11 +128,36 @@ pub struct ExpertDispatcher {
     /// `dispatch_one` is awaiting on. Removed (and the oneshot fires) the
     /// moment a matching `opoi.expert_result` arrives.
     pending: DashMap<ExpertAssignmentKey, oneshot::Sender<OpoiExpertResult>>,
+    /// D2 live-topology follow-up (2026-07-26): the wallet most recently
+    /// (attempted to be) dispatched for each key — unlike `assignments`
+    /// above, deliberately NEVER removed on completion/failure, so a live
+    /// topology/audit report (see `ShardEngine::topology_snapshot`) can
+    /// still answer "who ran this expert" after the dispatch that mattered
+    /// has already finished. A retry overwrites the previous wallet for the
+    /// same key (the newer attempt is the one that matters); process-
+    /// lifetime only, same as every other piece of this module's state —
+    /// no persistence, no eviction (bounded in practice by how many
+    /// distinct (request, layer, expert) keys a live process ever sees).
+    recent: DashMap<ExpertAssignmentKey, String>,
 }
 
 impl ExpertDispatcher {
     pub fn new(registry: Arc<MinerRegistry>) -> Self {
-        Self { registry, assignments: DashMap::new(), pending: DashMap::new() }
+        Self { registry, assignments: DashMap::new(), pending: DashMap::new(), recent: DashMap::new() }
+    }
+
+    /// D2 live-topology follow-up: every expert dispatch this process has
+    /// ever attempted for one `(request_id, layer_start, layer_end)` range,
+    /// most-recently-dispatched wallet per `expert_id` — see `recent`'s doc
+    /// comment for why this outlives the dispatch itself. Used by
+    /// `ShardEngine::topology_snapshot` to answer "which wallet ran expert
+    /// N of this range" for a live/recent report.
+    pub fn recent_assignments_for_range(&self, request_id: &str, layer_start: u32, layer_end: u32) -> Vec<(u32, String)> {
+        self.recent
+            .iter()
+            .filter(|e| e.key().request_id == request_id && e.key().layer_start == layer_start && e.key().layer_end == layer_end)
+            .map(|e| (e.key().expert_id, e.value().clone()))
+            .collect()
     }
 
     /// Dispatches every selected expert of one `(request_id, layer_start,
@@ -342,6 +367,11 @@ impl ExpertDispatcher {
         let (result_tx, result_rx) = oneshot::channel();
         self.assignments.insert(key.clone(), wallet.to_string());
         self.pending.insert(key.clone(), result_tx);
+        // D2 live-topology follow-up: recorded here (attempt time), not
+        // only on success — a report asking "who was this expert asked to
+        // run against" mid-flight (or after a since-failed attempt) should
+        // still see the most recent try, not nothing. See `recent`'s doc.
+        self.recent.insert(key.clone(), wallet.to_string());
 
         if tx.send(wire::build_expert_assign_line(&assign)).is_err() {
             self.assignments.remove(&key);
