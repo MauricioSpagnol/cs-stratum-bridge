@@ -214,6 +214,27 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
+    if cfg.admin_report_enabled() {
+        let report_url = cfg.admin_report_url.clone();
+        let api_key = cfg.admin_report_api_key.clone();
+        let pool_id = cfg.effective_admin_report_pool_id().to_string();
+        tracing::info!(url = %report_url, pool_id = %pool_id, "topology reporting to cs-admin-manager enabled");
+        let http_client = reqwest::Client::new();
+        spawn_interval(cfg.admin_report_interval_ms, {
+            let shard_engine = shard_engine.clone();
+            move || {
+                let shard_engine = shard_engine.clone();
+                let http_client = http_client.clone();
+                let report_url = report_url.clone();
+                let api_key = api_key.clone();
+                let pool_id = pool_id.clone();
+                async move {
+                    opoi::topology_report::report_tick(&shard_engine, &http_client, &report_url, &api_key, &pool_id).await;
+                }
+            }
+        });
+    }
+
     let app_state = AppState { db: db_pool.clone(), engine: engine.clone(), shard_engine: shard_engine.clone(), cfg: cfg.clone() };
     let http_router = http::router(app_state);
     let http_addr = cfg.http_listen_addr.clone();

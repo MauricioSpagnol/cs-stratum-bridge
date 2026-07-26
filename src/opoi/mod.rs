@@ -7,6 +7,7 @@ pub mod expert_vram;
 pub mod handler;
 pub mod shard_engine;
 pub mod speculative_engine;
+pub mod topology_report;
 pub mod wire;
 
 pub use engine::OpoiEngine;

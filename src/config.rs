@@ -128,6 +128,30 @@ pub struct Config {
     /// runs via the local subprocess only.
     #[arg(long, env = "AUDITOR_TRUSTED_WALLETS", default_value = "")]
     pub auditor_trusted_wallets: String,
+
+    /// Optional: base URL of a cs-admin-manager's public topology-report
+    /// endpoint (e.g. https://admin.example.com/api/opoi/topology). If set,
+    /// this bridge periodically POSTs (push, not pull) its own live
+    /// per-shard/per-expert topology there — this bridge may run on any
+    /// miner/pool operator's own network with no inbound reachability at
+    /// all, so the bridge has to be the one initiating the connection.
+    /// Empty (the default) disables reporting entirely — this is opt-in,
+    /// same shape as `b3lite_receipt_secret` above.
+    #[arg(long, env = "ADMIN_REPORT_URL", default_value = "")]
+    pub admin_report_url: String,
+
+    /// Shared secret sent as the x-admin-report-key header on every report
+    /// — must match the receiving cs-admin-manager's own configured key.
+    #[arg(long, env = "ADMIN_REPORT_API_KEY", default_value = "")]
+    pub admin_report_api_key: String,
+
+    /// How this bridge identifies itself in reports. Defaults to its own
+    /// effective payout address (always unique per operator) if unset.
+    #[arg(long, env = "ADMIN_REPORT_POOL_ID", default_value = "")]
+    pub admin_report_pool_id: String,
+
+    #[arg(long, env = "ADMIN_REPORT_INTERVAL_MS", default_value_t = 8_000)]
+    pub admin_report_interval_ms: u64,
 }
 
 impl Config {
@@ -162,6 +186,23 @@ impl Config {
     /// empty key, which would be a receipt anyone could forge).
     pub fn b3lite_enabled(&self) -> bool {
         !self.b3lite_receipt_secret.is_empty()
+    }
+
+    /// Topology reporting is opt-in: no admin-report URL configured means
+    /// this bridge never dials out anywhere with live shard/expert
+    /// assignment data.
+    pub fn admin_report_enabled(&self) -> bool {
+        !self.admin_report_url.is_empty()
+    }
+
+    /// Identifier this bridge reports itself as — explicit
+    /// ADMIN_REPORT_POOL_ID if set, otherwise the effective payout address.
+    pub fn effective_admin_report_pool_id(&self) -> &str {
+        if self.admin_report_pool_id.is_empty() {
+            self.effective_payout_address()
+        } else {
+            &self.admin_report_pool_id
+        }
     }
 
     /// Parses `auditor_trusted_wallets` into a trimmed, non-empty list —

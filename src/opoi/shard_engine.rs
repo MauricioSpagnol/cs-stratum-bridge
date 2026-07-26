@@ -543,6 +543,13 @@ impl ShardEngine {
         })
     }
 
+    /// Every request_id with a live pipeline in this process right now —
+    /// the input `topology_report`'s periodic push loop iterates to know
+    /// which `topology_snapshot` calls to make.
+    pub fn active_request_ids(&self) -> Vec<String> {
+        self.pipelines.iter().map(|e| e.key().clone()).collect()
+    }
+
     /// Returns `true` if `model_id` resolves to an ACTIVE manifest — the
     /// exact check `OpoiEngine::poll_and_assign_tick` uses to decide whether
     /// a PENDING request belongs to this engine instead.
@@ -2770,5 +2777,9 @@ mod d2_expert_group_dispatch_tests {
         assert!(!primary_snap.expert_capable);
 
         assert!(engine.topology_snapshot("never-existed").is_none());
+
+        // active_request_ids() is the topology-report push loop's input —
+        // it must see exactly this one live pipeline.
+        assert_eq!(engine.active_request_ids(), vec!["req-topo".to_string()]);
     }
 }
