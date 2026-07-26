@@ -698,7 +698,7 @@ impl ShardEngine {
                     self.pipelines.remove(&request_id);
                     return Ok(());
                 };
-                return self.handle_moe_interior_layer_result(&request_id, &source, expert_ids, layer_idx, &result).await;
+                return self.handle_moe_interior_layer_result(&request_id, wallet, &source, expert_ids, layer_idx, &result).await;
             }
         }
 
@@ -754,7 +754,7 @@ impl ShardEngine {
                 // `moe_layer_step` is `None` — identical value either way.
                 let layer_end = { self.pipelines.get(&request_id).map(|p| p.shards[p.pos].layer_end.unwrap_or(0)) }.unwrap_or(0);
                 let layer_idx = result.moe_layer_step.unwrap_or(layer_end.saturating_sub(1));
-                return self.handle_expert_group_result(&request_id, &source, expert_ids, layer_idx, &result).await;
+                return self.handle_expert_group_result(&request_id, wallet, &source, expert_ids, layer_idx, &result).await;
             }
             // Advance to the next shard in the SAME token step, feeding it
             // this shard's real output tensor.
@@ -866,6 +866,7 @@ impl ShardEngine {
     async fn handle_expert_group_result(
         &self,
         request_id: &str,
+        primary_wallet: &str,
         source: &ModelSource,
         expert_ids: Vec<u32>,
         layer_idx: u32,
@@ -995,7 +996,7 @@ impl ShardEngine {
 
         let combined = self
             .expert_dispatcher
-            .dispatch_and_join(request_id, layer_start, layer_end, layer_idx, token_index, &model_id, &source.gguf_url, &gguf_sha256, experts, move |_expert_id| min_vram_mb)
+            .dispatch_and_join(request_id, layer_start, layer_end, layer_idx, token_index, &model_id, &source.gguf_url, &gguf_sha256, experts, move |_expert_id| min_vram_mb, &[primary_wallet.to_string()])
             .await;
 
         match combined {
@@ -1057,6 +1058,7 @@ impl ShardEngine {
     async fn handle_moe_interior_layer_result(
         &self,
         request_id: &str,
+        primary_wallet: &str,
         source: &ModelSource,
         expert_ids: Vec<u32>,
         layer_idx: u32,
@@ -1153,7 +1155,7 @@ impl ShardEngine {
 
         let combined = self
             .expert_dispatcher
-            .dispatch_and_join(request_id, layer_start, layer_end, layer_idx, token_index, &model_id, &source.gguf_url, &gguf_sha256, experts, move |_expert_id| min_vram_mb)
+            .dispatch_and_join(request_id, layer_start, layer_end, layer_idx, token_index, &model_id, &source.gguf_url, &gguf_sha256, experts, move |_expert_id| min_vram_mb, &[primary_wallet.to_string()])
             .await;
 
         match combined {

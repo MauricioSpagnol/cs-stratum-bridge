@@ -163,6 +163,25 @@ impl ExpertDispatcher {
     /// host it — see `MinerRegistry::pick_expert_hosts_top_n`'s TODO on why
     /// that number isn't computed inside this module (GGUF/manifest expert
     /// size metadata isn't threaded through to this layer yet).
+    ///
+    /// `pre_excluded` — real self-deadlock found via live regtest
+    /// validation (2026-07-26): `ShardEngine`'s downstream connection for
+    /// each wallet is read by a single sequential loop
+    /// (`proxy/session.rs::down_reader_loop`) that awaits each message's
+    /// handler to completion before reading the connection's next line. If
+    /// the SAME wallet that's currently the dense/primary sender of the
+    /// `opoi.shard_result` this dispatch was triggered from is ALSO picked
+    /// as one of this group's expert hosts, that wallet's own
+    /// `opoi.expert_result` reply (needed to unblock THIS call, since it's
+    /// awaited from inside that same `handle_shard_result` call chain)
+    /// physically arrives on the very socket whose read loop is blocked
+    /// waiting for this call to return — a genuine deadlock, only ever
+    /// "resolved" by this expert's own per-attempt timeout eventually
+    /// firing (confirmed live: exactly `EXPERT_DISPATCH_TIMEOUT`, not
+    /// sooner). Callers pass the request's current primary wallet here so
+    /// it's excluded from selection up front — same mechanism as
+    /// `used_wallets` below, just seeded before the loop starts instead of
+    /// growing during it.
     #[allow(clippy::too_many_arguments)]
     pub async fn dispatch_and_join(
         &self,
@@ -176,6 +195,7 @@ impl ExpertDispatcher {
         model_gguf_sha256: &str,
         experts: Vec<SelectedExpert>,
         min_vram_mb_for: impl Fn(u32) -> u64,
+        pre_excluded: &[String],
     ) -> Result<ExpertOutputWire, String> {
         if experts.is_empty() {
             return Err("dispatch_and_join called with an empty expert list".to_string());
@@ -184,8 +204,11 @@ impl ExpertDispatcher {
             return Err(format!("dispatch_and_join called with layer_idx={layer_idx} outside its own range [{layer_start},{layer_end})"));
         }
 
-        // Up-front, sequential host selection (see doc comment above).
-        let mut used_wallets: Vec<String> = Vec::new();
+        // Up-front, sequential host selection (see doc comment above) —
+        // seeded with `pre_excluded` so the current dense/primary wallet
+        // (see this method's doc comment on `pre_excluded`) can never be
+        // picked as an expert host for its own request.
+        let mut used_wallets: Vec<String> = pre_excluded.to_vec();
         let mut planned: Vec<(SelectedExpert, String)> = Vec::new();
         for sel in experts {
             let min_vram = min_vram_mb_for(sel.expert_id);
@@ -560,6 +583,7 @@ mod dispatch_tests {
                 "req-1", 0, 4, 3, 0, "model-x", "http://gguf", "gguf-hash",
                 vec![expert(0, 0.5, 10.0), expert(1, 0.5, 20.0)],
                 |_expert_id| 1_000,
+                &[],
             )
             .await
         });
@@ -605,16 +629,40 @@ mod dispatch_tests {
         // the second can never be dispatched, so the whole group must fail
         // fast without ever sending a line for the first.
         let result = dispatcher
-            .dispatch_and_join("req-2", 0, 4, 3, 0, "model-x", "http://gguf", "gguf-hash", vec![expert(0, 0.5, 1.0), expert(1, 0.5, 2.0)], |_| 1_000)
+            .dispatch_and_join("req-2", 0, 4, 3, 0, "model-x", "http://gguf", "gguf-hash", vec![expert(0, 0.5, 1.0), expert(1, 0.5, 2.0)], |_| 1_000, &[])
             .await;
         assert!(result.is_err());
+    }
+
+    /// Real self-deadlock this session found via live regtest validation
+    /// (see `dispatch_and_join`'s `pre_excluded` doc comment): a wallet
+    /// that's also the request's current dense/primary sender must never
+    /// be picked as an expert host for its own request — even when it's
+    /// the ONLY otherwise-eligible host, `pre_excluded` must still win.
+    #[tokio::test]
+    async fn dispatch_and_join_never_picks_a_pre_excluded_wallet_even_as_the_only_eligible_host() {
+        let registry = Arc::new(MinerRegistry::new());
+        let (tx_primary, _rx_primary) = tokio::sync::mpsc::unbounded_channel();
+        registry.register("primary-wallet".to_string(), tx_primary);
+        registry.mark_expert_capable("primary-wallet", 24_000);
+
+        let dispatcher = ExpertDispatcher::new(registry);
+        let result = dispatcher
+            .dispatch_and_join(
+                "req-4", 0, 4, 3, 0, "model-x", "http://gguf", "gguf-hash",
+                vec![expert(0, 1.0, 1.0)],
+                |_| 1_000,
+                &["primary-wallet".to_string()],
+            )
+            .await;
+        assert!(result.is_err(), "the only registered expert-capable wallet is pre_excluded, so this must fail, not deadlock against it");
     }
 
     #[tokio::test]
     async fn dispatch_and_join_rejects_empty_expert_list() {
         let registry = Arc::new(MinerRegistry::new());
         let dispatcher = ExpertDispatcher::new(registry);
-        let result = dispatcher.dispatch_and_join("req-3", 0, 4, 3, 0, "model-x", "http://gguf", "gguf-hash", vec![], |_| 1_000).await;
+        let result = dispatcher.dispatch_and_join("req-3", 0, 4, 3, 0, "model-x", "http://gguf", "gguf-hash", vec![], |_| 1_000, &[]).await;
         assert!(result.is_err());
     }
 
@@ -624,7 +672,7 @@ mod dispatch_tests {
         let dispatcher = ExpertDispatcher::new(registry);
         // layer_idx=4 is NOT inside [0,4) — must be rejected up front,
         // before ever attempting to pick a host or dispatch anything.
-        let result = dispatcher.dispatch_and_join("req-3b", 0, 4, 4, 0, "model-x", "http://gguf", "gguf-hash", vec![expert(0, 1.0, 1.0)], |_| 1_000).await;
+        let result = dispatcher.dispatch_and_join("req-3b", 0, 4, 4, 0, "model-x", "http://gguf", "gguf-hash", vec![expert(0, 1.0, 1.0)], |_| 1_000, &[]).await;
         assert!(result.is_err());
     }
 
