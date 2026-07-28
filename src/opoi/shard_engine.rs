@@ -878,9 +878,30 @@ impl ShardEngine {
         // below now takes an explicit `layer_idx` so it dispatches the
         // correct absolute layer either way.
         if let Some(layer_idx) = result.moe_layer_step {
-            let layer_end = { self.pipelines.get(&request_id).map(|p| p.shards[p.pos].layer_end.unwrap_or(0)) };
-            let Some(layer_end) = layer_end else { return Err(crate::error::AppError::UnknownRequest) };
-            if layer_end == 0 || layer_idx + 1 < layer_end {
+            let layer_end_and_total = {
+                self.pipelines.get(&request_id).map(|p| (p.shards[p.pos].layer_end.unwrap_or(0), p.manifest.num_layers))
+            };
+            let Some((layer_end, total_layers)) = layer_end_and_total else { return Err(crate::error::AppError::UnknownRequest) };
+            // D2 finalize follow-up (2026-07-28): `layer_idx + 1 == layer_end
+            // && layer_end == total_layers` is this range's BOUNDARY layer,
+            // but the range covers the model's own LAST layer — there is no
+            // next dense shard to hand this off to (unlike an ordinary
+            // mid-pipeline boundary, which still falls through to
+            // `handle_expert_group_result`/the plain dense-to-dense handoff
+            // below, unchanged). Route it through the SAME interior-style
+            // resume mechanism instead: dispatch this boundary layer's real
+            // experts, combine, then resume the SAME pinned wallet with
+            // `moe_layer_step = Some(layer_end)` — the FINALIZE marker
+            // `moe_range_session.rs`'s `step_blocking` recognizes (one past
+            // the range's last real layer) to run the real final norm+
+            // lm_head decode and report a genuine `next_token_id`. That
+            // finalize reply comes back with `moe_layer_step = Some(layer_end)`
+            // too, for which `layer_idx + 1 < layer_end` is false and this
+            // whole `if` is skipped — it falls through to the ordinary
+            // "commit generated token" logic below, where `next_token_id` is
+            // now genuinely populated instead of the dead end that logic
+            // used to hit.
+            if layer_end == 0 || layer_idx + 1 < layer_end || (layer_idx + 1 == layer_end && layer_end == total_layers) {
                 let expert_ids = { self.pipelines.get(&request_id).and_then(|p| p.expert_group_for(p.pos).cloned()) };
                 let Some(expert_ids) = expert_ids else {
                     tracing::error!(
@@ -962,20 +983,23 @@ impl ShardEngine {
             return Ok(());
         }
 
-        // D2 (narrower gap, see this file's module doc): the LAST dense
-        // shard can have a registered EXPERT group too (every layer range
-        // gets one when numExperts > 0), but there is no wire mechanism yet
-        // to route a combined MoE output into a final norm+lm_head/
-        // next-token decode step — no shard type exists for "run final
-        // norm+lm_head over this externally-combined hidden state". Log it
-        // clearly and fall back to the primary's own reported
-        // `next_token_id` below, unchanged, same as a non-expert-routed
-        // model — do NOT dispatch experts here (there is no consumer for
-        // the combined output yet, so it would be wasted network work).
+        // D2 finalize follow-up (2026-07-28): for the NEW per-layer-walk
+        // protocol, the LAST dense shard's boundary layer (and the
+        // finalize resume that follows it) are now intercepted ABOVE, in
+        // the `result.moe_layer_step` routing block — this point is only
+        // ever reached for that protocol on the finalize reply itself
+        // (`next_token_id` already populated by then). This warning is now
+        // only reachable via the OLD whole-range-in-one-shot path
+        // (`compute_moe_router_only`, `moe_layer_step == None`), which
+        // genuinely still has no external-dispatch mechanism for its own
+        // last layer's experts — it always computes them locally and
+        // reports a real `next_token_id` directly, so the fallback below
+        // is expected to succeed for it, this is informational only.
         if let Some(expert_ids) = &expert_ids {
             tracing::warn!(
                 request_id = %request_id, shard_index = result.shard_index, registered_experts = expert_ids.len(),
-                "D2: last dense shard's layer range has registered EXPERT nodes, but no wire mechanism exists yet to route a combined MoE output into final next-token decoding — falling back to the primary's own reported next_token_id unchanged"
+                "D2: last dense shard's layer range has registered EXPERT nodes (OLD whole-range-in-one-shot path — the new \
+                 per-layer-walk protocol's finalize mechanism already ran, this reply already carries a real next_token_id)"
             );
         }
 
@@ -1219,10 +1243,16 @@ impl ShardEngine {
         }
     }
 
-    /// D2 multi-layer STATEFUL resume (2026-07-26 follow-up session): the
-    /// NEW-protocol counterpart of `handle_expert_group_result` above, for
-    /// an INTERIOR layer of a multi-layer range walk (`layer_idx + 1 <
-    /// layer_end` — NOT this range's last layer). Structurally almost
+    /// D2 multi-layer STATEFUL resume (2026-07-26 follow-up session,
+    /// broadened 2026-07-28 to also cover the finalize case — see the
+    /// caller's routing comment): the NEW-protocol counterpart of
+    /// `handle_expert_group_result` above, for either an INTERIOR layer of
+    /// a multi-layer range walk (`layer_idx + 1 < layer_end`) OR the
+    /// BOUNDARY layer of a range that covers the model's own LAST layer
+    /// (`layer_idx + 1 == layer_end == total_layers` — no next dense shard
+    /// to hand off to, so it resumes the SAME wallet one more time with the
+    /// FINALIZE marker `moe_layer_step = Some(layer_end)` instead, exactly
+    /// like an ordinary interior resume). Structurally almost
     /// identical to that method (same validation, same
     /// `ExpertDispatcher::dispatch_and_join` call, same combine), with two
     /// deliberate differences that follow directly from the on-chain
