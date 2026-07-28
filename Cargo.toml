@@ -30,6 +30,14 @@ reqwest     = { version = "0.12", default-features = false, features = ["json", 
 
 # database
 sqlx        = { version = "0.7", features = ["runtime-tokio-rustls", "postgres", "chrono", "macros", "migrate"] }
+# Embedded Postgres: operators running a bridge/miner shouldn't need to
+# install or administer a separate Postgres server themselves — this
+# downloads and manages a real Postgres binary as a private subprocess,
+# speaking the same wire protocol sqlx already uses, so every existing
+# query/migration is untouched. Only used when DATABASE_URL isn't set
+# (see config.rs/main.rs); an operator who already runs their own Postgres
+# can still point at it directly.
+postgresql_embedded = "0.21"
 
 # crypto / encoding
 sha2        = "0.10"

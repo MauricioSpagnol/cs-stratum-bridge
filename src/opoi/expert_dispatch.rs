@@ -101,10 +101,21 @@ pub struct SelectedExpert {
 /// expert_id)`, deliberately NOT one global timeout for the whole fan-out
 /// group (see the D2 scope doc: "Model timeout/reassignment per-expert-
 /// dispatch independently ... since different experts may be hosted on
-/// machines with very different latency"). Shorter than B3-lite's
-/// `STRATUM_AUDIT_TIMEOUT` (180s, a whole audit replay) — a single expert's
-/// FFN over one token's activation is a much smaller unit of work.
-const EXPERT_DISPATCH_TIMEOUT: Duration = Duration::from_secs(45);
+/// machines with very different latency").
+///
+/// Was 45s (sized for just "a single expert's FFN over one token's
+/// activation," a fast compute-only unit) until a real multi-rig live
+/// test (2026-07-27) hit it constantly: `expert_pool_client.rs` still
+/// loads the WHOLE GGUF file on a cold cache (a known, documented gap —
+/// no true attention-free per-expert loader exists yet), so a host's
+/// FIRST dispatch for any given model has to finish a real multi-hundred-
+/// MB download over the LAN before it can even start computing —
+/// observed live taking several minutes on a real network (not
+/// localhost). 45s only ever worked by accident when a host happened to
+/// already have that model cached from a previous request. Once cached,
+/// actual dispatch is fast (well under a second) — this timeout mostly
+/// needs to cover the WORST case (cold download), not the common case.
+const EXPERT_DISPATCH_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// A timed-out (or disconnected-mid-flight) expert dispatch is retried
 /// against a different eligible host this many times before that expert

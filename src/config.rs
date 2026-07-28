@@ -25,8 +25,26 @@ pub struct Config {
     pub csd_rpc_pass: String,
 
     /// Postgres connection string, dedicated database for this service.
+    /// Optional: if unset, the bridge starts and manages its OWN private
+    /// embedded Postgres instance (see `postgresql_embedded` in main.rs) —
+    /// no external Postgres install/administration required. Set this only
+    /// if you already run your own Postgres server and want the bridge to
+    /// use it instead.
     #[arg(long, env = "DATABASE_URL")]
-    pub database_url: String,
+    pub database_url: Option<String>,
+
+    /// Data directory for the embedded Postgres instance (ignored if
+    /// DATABASE_URL is set). Persistent across restarts — this is where
+    /// submissions/payout history actually lives, same as any other
+    /// Postgres data directory.
+    #[arg(long, env = "EMBEDDED_DB_DATA_DIR", default_value = "./bridge_pgdata")]
+    pub embedded_db_data_dir: String,
+
+    /// TCP port the embedded Postgres instance listens on (loopback only,
+    /// ignored if DATABASE_URL is set). Only needs to not collide with
+    /// another Postgres already running on this host.
+    #[arg(long, env = "EMBEDDED_DB_PORT", default_value_t = 5488)]
+    pub embedded_db_port: u16,
 
     /// Comma-separated list of the bridge's OPoI stake identities. Each
     /// address's private key must already be imported in csd's own wallet

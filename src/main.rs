@@ -41,10 +41,75 @@ async fn main() -> anyhow::Result<()> {
         "cs-stratum-bridge starting"
     );
 
-    let db_pool = sqlx::postgres::PgPoolOptions::new()
-        .max_connections(10)
-        .connect(&cfg.database_url)
-        .await?;
+    // Embedded Postgres (2026-07-27): an operator installing/running this
+    // bridge shouldn't need to separately install and administer a Postgres
+    // server. If DATABASE_URL isn't set, spin up a private Postgres
+    // instance this process owns end-to-end — same wire protocol, so every
+    // existing sqlx query/migration below is untouched. `embedded_pg` is
+    // kept alive in this scope (not dropped) for the whole process
+    // lifetime and stopped explicitly at shutdown, below.
+    let (db_pool, embedded_pg) = match &cfg.database_url {
+        Some(url) => {
+            let pool = sqlx::postgres::PgPoolOptions::new().max_connections(10).connect(url).await?;
+            (pool, None)
+        }
+        None => {
+            tracing::info!(
+                data_dir = %cfg.embedded_db_data_dir, port = cfg.embedded_db_port,
+                "DATABASE_URL not set — starting embedded PostgreSQL (no external Postgres install required)"
+            );
+            // Deliberately NOT overriding `username`: this crate's initdb
+            // always bootstraps the superuser as "postgres"
+            // (`BOOTSTRAP_SUPERUSER`, hardcoded in `initialize()`) —
+            // ignoring `Settings::username` entirely, so setting it to
+            // anything else would silently create a mismatched, unusable
+            // role.
+            //
+            // `password` DOES need to be pinned to a fixed, persistent
+            // file: `Settings::default()` generates a fresh RANDOM password
+            // (and a fresh temp `password_file` path) on every construction,
+            // only ever actually applied to the real Postgres role on the
+            // very first run (`initialize()`, which writes it into
+            // `password_file`, is skipped on every later run once the data
+            // dir is already initialized) — a naive restart would build a
+            // connection URL with a brand-new random password that no
+            // longer matches the role. Fix: pin `password_file` next to
+            // `data_dir` and read its content back on restart instead of
+            // trusting a freshly-generated one.
+            let password_file = std::path::PathBuf::from(format!("{}.pgpass", cfg.embedded_db_data_dir));
+            let password = if password_file.exists() {
+                std::fs::read_to_string(&password_file)?.trim().to_string()
+            } else {
+                uuid::Uuid::new_v4().simple().to_string()
+            };
+            let settings = postgresql_embedded::Settings {
+                data_dir: std::path::PathBuf::from(&cfg.embedded_db_data_dir),
+                port: cfg.embedded_db_port,
+                password_file,
+                password,
+                // NOT a scratch/test instance — this is the bridge's real,
+                // persistent database. `temporary: true` (this crate's
+                // usual default, meant for ephemeral test fixtures) would
+                // wipe submissions/payout history on every stop.
+                temporary: false,
+                ..Default::default()
+            };
+            let mut pg = postgresql_embedded::PostgreSQL::new(settings);
+            // First run on a fresh host downloads a real Postgres binary
+            // release over HTTPS (cached afterward) — needs outbound
+            // internet access once; every subsequent start reuses the
+            // cached binary and this host's persisted data_dir.
+            pg.setup().await?;
+            pg.start().await?;
+            const DB_NAME: &str = "cs_stratum_bridge";
+            if !pg.database_exists(DB_NAME).await? {
+                pg.create_database(DB_NAME).await?;
+            }
+            let url = pg.settings().url(DB_NAME);
+            let pool = sqlx::postgres::PgPoolOptions::new().max_connections(10).connect(&url).await?;
+            (pool, Some(pg))
+        }
+    };
     sqlx::migrate!("./migrations").run(&db_pool).await?;
     tracing::info!("database connected and migrated");
 
@@ -276,6 +341,12 @@ async fn main() -> anyhow::Result<()> {
         }
         _ = tokio::signal::ctrl_c() => {
             tracing::info!("received shutdown signal");
+        }
+    }
+
+    if let Some(pg) = &embedded_pg {
+        if let Err(e) = pg.stop().await {
+            tracing::warn!(error = %e, "failed to stop embedded PostgreSQL cleanly");
         }
     }
 
