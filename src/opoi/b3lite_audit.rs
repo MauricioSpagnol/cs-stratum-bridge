@@ -125,8 +125,8 @@ impl B3LiteAuditor {
     async fn run_one(&self, receipt: B3LiteReceipt) {
         let request_id = receipt.request_id.clone();
 
-        let Some(source) = self.model_sources.get(&receipt.model_id).cloned() else {
-            tracing::warn!(request_id = %request_id, model_id = %receipt.model_id, "b3lite audit: no MODEL_SOURCES_JSON entry, cannot resolve GGUF — marking INCONCLUSIVE");
+        let Some(source) = self.model_sources.resolve(&receipt.model_id).await else {
+            tracing::warn!(request_id = %request_id, model_id = %receipt.model_id, "b3lite audit: no model source (local override or cs-marketplace), cannot resolve GGUF — marking INCONCLUSIVE");
             self.mark_inconclusive(receipt.id, "no ModelSource entry for this model_id").await;
             return;
         };

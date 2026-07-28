@@ -143,13 +143,22 @@ use crate::stake_pool::StakePool;
 
 /// Where to download a model's GGUF/tokenizer from — not on-chain data (the
 /// manifest only carries `backbone_pom_root`, the expected hash), so this is
-/// local operator config. Loaded once from `MODEL_SOURCES_JSON` (env var: a
-/// JSON object `{"MODEL_ID": {"gguf_url": "...", "tokenizer_url": "..."}}`).
-/// A model with no entry here simply never gets shard-dispatched (treated
-/// the same as "no manifest" by callers).
+/// operator-curated config, resolved two ways (local wins):
+///   1. `MODEL_SOURCES_JSON` (env var, JSON object
+///      `{"MODEL_ID": {"gguf_url": "...", ...}}`) — explicit local override,
+///      loaded once at startup. Kept for operators who want to fully pin
+///      their own sources without depending on any external service.
+///   2. cs-marketplace (`CS_MARKETPLACE_URL`/`CS_MARKETPLACE_TOKEN`) — a
+///      `GET {url}/api/models/{model_id}` catalog lookup, cached in memory
+///      with a TTL, added so bridge operators don't have to hand-write JSON
+///      for every model the D2 network supports (see
+///      cs-cloud/marketplace/backend `api/models.py`).
+/// A model resolved by neither path simply never gets shard-dispatched
+/// (treated the same as "no manifest" by callers).
 #[derive(Clone)]
 pub struct ModelSourceConfig {
     sources: std::collections::HashMap<String, ModelSource>,
+    marketplace: Option<MarketplaceClient>,
 }
 
 #[derive(Clone, serde::Deserialize)]
@@ -164,6 +173,47 @@ pub struct ModelSource {
     pub tokenizer_sha256: String,
 }
 
+const MARKETPLACE_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(300);
+
+#[derive(Clone)]
+struct MarketplaceClient {
+    base_url: String,
+    token: String,
+    http: reqwest::Client,
+    cache: Arc<DashMap<String, (ModelSource, std::time::Instant)>>,
+}
+
+impl MarketplaceClient {
+    async fn resolve(&self, model_id: &str) -> Option<ModelSource> {
+        if let Some(entry) = self.cache.get(model_id) {
+            if entry.1.elapsed() < MARKETPLACE_CACHE_TTL {
+                return Some(entry.0.clone());
+            }
+        }
+        let url = format!("{}/api/models/{}", self.base_url.trim_end_matches('/'), model_id);
+        let resp = match self.http.get(&url).header("X-Stratum-Bridge-Token", &self.token).send().await {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!(model_id = %model_id, error = %e, "cs-marketplace lookup failed (network error)");
+                return None;
+            }
+        };
+        if !resp.status().is_success() {
+            tracing::warn!(model_id = %model_id, status = %resp.status(), "cs-marketplace has no entry for this model");
+            return None;
+        }
+        let source: ModelSource = match resp.json().await {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(model_id = %model_id, error = %e, "cs-marketplace returned a malformed model source");
+                return None;
+            }
+        };
+        self.cache.insert(model_id.to_string(), (source.clone(), std::time::Instant::now()));
+        Some(source)
+    }
+}
+
 impl ModelSourceConfig {
     pub fn from_env() -> Self {
         let raw = std::env::var("MODEL_SOURCES_JSON").unwrap_or_default();
@@ -171,15 +221,33 @@ impl ModelSourceConfig {
             std::collections::HashMap::new()
         } else {
             serde_json::from_str(&raw).unwrap_or_else(|e| {
-                tracing::warn!(error = %e, "MODEL_SOURCES_JSON is set but failed to parse; shard dispatch disabled for all models");
+                tracing::warn!(error = %e, "MODEL_SOURCES_JSON is set but failed to parse; local overrides disabled for all models");
                 std::collections::HashMap::new()
             })
         };
-        Self { sources }
+
+        let marketplace = std::env::var("CS_MARKETPLACE_URL")
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+            .map(|base_url| MarketplaceClient {
+                base_url,
+                token: std::env::var("CS_MARKETPLACE_TOKEN").unwrap_or_default(),
+                http: reqwest::Client::new(),
+                cache: Arc::new(DashMap::new()),
+            });
+
+        Self { sources, marketplace }
     }
 
-    pub fn get(&self, model_id: &str) -> Option<&ModelSource> {
-        self.sources.get(model_id)
+    /// `MODEL_SOURCES_JSON` entries win (explicit local override, no network
+    /// call); otherwise falls back to the cs-marketplace catalog lookup
+    /// (cached — see `MARKETPLACE_CACHE_TTL`). Returns `None` if neither is
+    /// configured or the model isn't found in either.
+    pub async fn resolve(&self, model_id: &str) -> Option<ModelSource> {
+        if let Some(source) = self.sources.get(model_id) {
+            return Some(source.clone());
+        }
+        self.marketplace.as_ref()?.resolve(model_id).await
     }
 }
 
@@ -585,8 +653,8 @@ impl ShardEngine {
                 tracing::warn!(model = %req.model, "ACTIVE manifest but getmodelgraph failed; skipping this tick");
                 continue;
             };
-            let Some(source) = self.model_sources.get(&req.model) else {
-                tracing::warn!(model = %req.model, "no MODEL_SOURCES_JSON entry — cannot resolve a download URL, skipping");
+            let Some(source) = self.model_sources.resolve(&req.model).await else {
+                tracing::warn!(model = %req.model, "no model source (local override or cs-marketplace) — cannot resolve a download URL, skipping");
                 continue;
             };
 
@@ -674,7 +742,7 @@ impl ShardEngine {
         for request_id in stalled {
             let model_id = { self.pipelines.get(&request_id).map(|p| p.manifest.model_id.clone()) };
             let Some(model_id) = model_id else { continue };
-            let Some(source) = self.model_sources.get(&model_id).cloned() else { continue };
+            let Some(source) = self.model_sources.resolve(&model_id).await else { continue };
             self.dispatch_current(&request_id, &source).await;
         }
     }
@@ -851,7 +919,7 @@ impl ShardEngine {
 
         let model_id = { self.pipelines.get(&request_id).map(|p| p.manifest.model_id.clone()) };
         let Some(model_id) = model_id else { return Err(crate::error::AppError::UnknownRequest) };
-        let Some(source) = self.model_sources.get(&model_id).cloned() else { return Err(crate::error::AppError::UnknownRequest) };
+        let Some(source) = self.model_sources.resolve(&model_id).await else { return Err(crate::error::AppError::UnknownRequest) };
 
         // Payout-attribution bookkeeping (see `PipelineState::contributions`
         // doc comment): every accepted shard result is one real unit of
@@ -2001,7 +2069,7 @@ mod d2_expert_group_dispatch_tests {
             model_id.to_string(),
             ModelSource { gguf_url: "http://gguf.example/model.gguf".to_string(), tokenizer_url: "http://gguf.example/tok".to_string(), tokenizer_sha256: "tok-hash".to_string() },
         );
-        ShardEngine::new(csd, db, registry, stake_pool, ModelSourceConfig { sources }, None, None, expert_dispatcher)
+        ShardEngine::new(csd, db, registry, stake_pool, ModelSourceConfig { sources, marketplace: None }, None, None, expert_dispatcher)
     }
 
     fn test_manifest(model_id: &str) -> ModelManifest {
