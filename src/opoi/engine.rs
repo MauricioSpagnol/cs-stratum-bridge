@@ -286,8 +286,31 @@ impl OpoiEngine {
             // `self.pending` rather than removed: harmless, re-checked next
             // tick at the same cost ShardEngine already pays for the same
             // model_id.
-            if matches!(self.csd.get_model_manifest(&model).await, Ok(m) if m.status == "ACTIVE") {
-                continue;
+            //
+            // D2 race fix (2026-07-28): a transient RPC failure here used to
+            // fail OPEN — `matches!(Err(_), Ok(m) if ...)` is `false`, so any
+            // csd hiccup (confirmed to happen live, e.g. right after a bridge
+            // restart's catch-up burst) made this silently treat an
+            // ACTIVE-manifest (shard-routed) model as a plain whole-model
+            // one and race ShardEngine for the request. Confirmed live: won
+            // that race once, assigned a shard-routed MoE request to a
+            // wallet only reachable through ShardEngine's own dispatch path,
+            // not this one's `OpoiAssign` — the miner never got anything,
+            // permanent silent stall (no error anywhere). Fail CLOSED
+            // instead: on ANY manifest-check failure, skip this candidate
+            // for this tick rather than guess — the next tick gets a fresh
+            // chance to determine ACTIVE status correctly before ever
+            // risking assignment down the wrong path.
+            match self.csd.get_model_manifest(&model).await {
+                Ok(m) if m.status == "ACTIVE" => continue,
+                Ok(_) => {}
+                Err(e) => {
+                    tracing::debug!(
+                        request_id = %request_id, model = %model, error = %e,
+                        "could not check model manifest status this tick — skipping rather than risk racing ShardEngine on a transient RPC error"
+                    );
+                    continue;
+                }
             }
 
             let wallet = {
