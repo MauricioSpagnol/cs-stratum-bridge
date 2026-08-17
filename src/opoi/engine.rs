@@ -304,6 +304,19 @@ impl OpoiEngine {
             match self.csd.get_model_manifest(&model).await {
                 Ok(m) if m.status == "ACTIVE" => continue,
                 Ok(_) => {}
+                // "no manifest exists for this model at all" is a definitive,
+                // permanent answer from csd (RPC_MISC_ERROR, "Model manifest
+                // not found for: ..."), not a transient hiccup — csd would
+                // keep saying so forever, so failing closed here (as the
+                // comment above does for genuine transient errors) would
+                // permanently stall EVERY plain, non-manifested OPEN-task
+                // request. Confirmed live: this was silently eating every
+                // request using a bare model name (the common case), never
+                // assigning it to any miner, `assigned_to` stuck null
+                // forever with no error surfaced anywhere. Treat it the same
+                // as `Ok(_)` above (not ACTIVE — proceed with whole-model
+                // assignment) instead of skipping.
+                Err(e) if e.to_string().to_lowercase().contains("not found") => {}
                 Err(e) => {
                     tracing::debug!(
                         request_id = %request_id, model = %model, error = %e,
