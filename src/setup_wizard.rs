@@ -27,32 +27,32 @@ struct RequiredVar {
 const REQUIRED_VARS: &[RequiredVar] = &[
     RequiredVar {
         key: "UPSTREAM_POOL_ADDR",
-        prompt: "Endereço (host:port) do back-pool real — todo tráfego mining.* é repassado pra lá",
+        prompt: "Address (host:port) of the real back-pool — all mining.* traffic is relayed there",
         suggested_default: None,
     },
     RequiredVar {
         key: "CSD_RPC_URL",
-        prompt: "URL do RPC do csd",
+        prompt: "csd RPC URL",
         suggested_default: Some("http://127.0.0.1:26124"),
     },
     RequiredVar {
         key: "CSD_RPC_USER",
-        prompt: "Usuário do RPC do csd (rpcuser no cs.conf)",
+        prompt: "csd RPC username (rpcuser in cs.conf)",
         suggested_default: None,
     },
     RequiredVar {
         key: "CSD_RPC_PASS",
-        prompt: "Senha do RPC do csd (rpcpassword no cs.conf)",
+        prompt: "csd RPC password (rpcpassword in cs.conf)",
         suggested_default: None,
     },
     RequiredVar {
         key: "OPOI_ADDRESSES",
-        prompt: "Endereço CS que vai fazer a stake OPoI (a chave privada já precisa estar importada na wallet do csd)",
+        prompt: "CS address that will hold the OPoI stake (its private key must already be imported into the csd wallet)",
         suggested_default: None,
     },
     RequiredVar {
         key: "OPOI_REQUESTER_API_KEY",
-        prompt: "Chave de API pra quem for enviar prompts usar (header x-opoi-api-key)",
+        prompt: "API key for whoever will submit prompts (x-opoi-api-key header)",
         suggested_default: None,
     },
 ];
@@ -75,14 +75,14 @@ pub async fn ensure_configured() {
     }
 
     println!();
-    println!("cs-stratum-bridge: configuração incompleta — falta(m) {} variável(is):", missing.len());
+    println!("cs-stratum-bridge: incomplete configuration — missing {} variable(s):", missing.len());
     for v in &missing {
         println!("  - {}", v.key);
     }
     println!();
-    println!("Como prefere configurar?");
-    println!("  1) Manual — fecho aqui, você edita o {ENV_PATH} e roda de novo");
-    println!("  2) Automático — eu pergunto cada valor, testo a conexão com o csd, e mostro as UTXOs disponíveis pra stake");
+    println!("How would you like to configure it?");
+    println!("  1) Manual — I'll exit here, you edit {ENV_PATH} and run again");
+    println!("  2) Automatic — I'll ask for each value, test the connection to csd, and show the available UTXOs for the stake");
     print!("> ");
     io::stdout().flush().ok();
 
@@ -107,13 +107,13 @@ fn run_manual() {
     let env_exists = Path::new(ENV_PATH).exists();
     if !env_exists && Path::new(ENV_EXAMPLE_PATH).exists() {
         match std::fs::copy(ENV_EXAMPLE_PATH, ENV_PATH) {
-            Ok(_) => println!("Criei {ENV_PATH} a partir de {ENV_EXAMPLE_PATH} — preencha os valores reais e rode de novo."),
-            Err(e) => println!("Não consegui copiar {ENV_EXAMPLE_PATH} pra {ENV_PATH} ({e}) — crie o arquivo manualmente e rode de novo."),
+            Ok(_) => println!("Created {ENV_PATH} from {ENV_EXAMPLE_PATH} — fill in the real values and run again."),
+            Err(e) => println!("Couldn't copy {ENV_EXAMPLE_PATH} to {ENV_PATH} ({e}) — create the file by hand and run again."),
         }
     } else if env_exists {
-        println!("{ENV_PATH} já existe mas está faltando a(s) variável(is) acima — edite-o e rode de novo.");
+        println!("{ENV_PATH} already exists but is missing the variable(s) above — edit it and run again.");
     } else {
-        println!("Crie um arquivo {ENV_PATH} nesta pasta com a(s) variável(is) acima e rode de novo.");
+        println!("Create a {ENV_PATH} file in this folder with the variable(s) above and run again.");
     }
     std::process::exit(1);
 }
@@ -137,25 +137,25 @@ async fn run_automatic() {
         let client = CsdRpcClient::new(rpc_url.clone(), rpc_user, rpc_pass);
 
         println!();
-        println!("Testando conexão com o csd em {rpc_url}...");
+        println!("Testing connection to csd at {rpc_url}...");
         match client.get_chain_height().await {
             Ok(height) => {
-                println!("OK — csd respondeu, altura atual: {height}");
+                println!("OK — csd responded, current height: {height}");
                 connected = true;
                 break;
             }
             Err(e) => {
-                println!("Falha ao conectar: {e}");
-                print!("Tentar de novo com outros dados de CSD_RPC_URL/USER/PASS? (s/n) ");
+                println!("Connection failed: {e}");
+                print!("Try again with different CSD_RPC_URL/USER/PASS values? (y/n) ");
                 io::stdout().flush().ok();
-                if read_line().trim().eq_ignore_ascii_case("s") {
+                if read_line().trim().eq_ignore_ascii_case("y") {
                     for key in ["CSD_RPC_URL", "CSD_RPC_USER", "CSD_RPC_PASS"] {
                         let value = prompt_value(var_by_key(key));
                         set_collected(&mut collected, key, value);
                     }
                 } else {
                     println!(
-                        "Seguindo sem validar a conexão — configure OPOI_COLLATERAL_TXID/OPOI_COLLATERAL_VOUT no {ENV_PATH} manualmente depois, se precisar."
+                        "Continuing without validating the connection — configure OPOI_COLLATERAL_TXID/OPOI_COLLATERAL_VOUT in {ENV_PATH} by hand later, if needed."
                     );
                     break;
                 }
@@ -174,7 +174,7 @@ async fn run_automatic() {
 
     write_env_file(&collected);
     println!();
-    println!("{ENV_PATH} salvo. Continuando...");
+    println!("{ENV_PATH} saved. Continuing...");
     println!();
 }
 
@@ -207,12 +207,12 @@ async fn maybe_offer_stake_picker(client: &CsdRpcClient, primary: &str, collecte
     match client.get_opoi_stake(primary).await {
         Ok(Some(_)) => {
             println!();
-            println!("Endereço {primary} já tem stake OPoI ativa — não precisa de colateral nova.");
+            println!("Address {primary} already has an active OPoI stake — no new collateral needed.");
         }
         Ok(None) => offer_stake_utxo_picker(client, collected).await,
         Err(e) => {
             println!();
-            println!("Não consegui checar se {primary} já tem stake ({e}) — mostrando as UTXOs disponíveis mesmo assim, caso queira configurar uma colateral.");
+            println!("Couldn't check whether {primary} already has a stake ({e}) — showing the available UTXOs anyway, in case you want to configure collateral.");
             offer_stake_utxo_picker(client, collected).await;
         }
     }
@@ -251,11 +251,11 @@ async fn ensure_stake_configured() {
 
     println!();
     println!(
-        "Endereço OPoI {primary} ainda não tem stake ativa, e OPOI_COLLATERAL_TXID não está configurado no {ENV_PATH} — sem isso o cs-stratum-bridge não consegue subir."
+        "OPoI address {primary} doesn't have an active stake yet, and OPOI_COLLATERAL_TXID isn't set in {ENV_PATH} — without it, cs-stratum-bridge can't start."
     );
-    print!("Quer escolher uma UTXO agora como colateral da stake? (s/n) ");
+    print!("Pick a UTXO now as the stake collateral? (y/n) ");
     io::stdout().flush().ok();
-    if !read_line().trim().eq_ignore_ascii_case("s") {
+    if !read_line().trim().eq_ignore_ascii_case("y") {
         return;
     }
 
@@ -294,20 +294,20 @@ fn prompt_value(v: &RequiredVar) -> String {
         if !value.is_empty() {
             return value;
         }
-        println!("Valor obrigatório, tente de novo.");
+        println!("This value is required, try again.");
     }
 }
 
 fn prompt_api_key(v: &RequiredVar) -> String {
     println!();
     println!("{}: {}", v.key, v.prompt);
-    print!("[Enter para gerar uma chave aleatória] > ");
+    print!("[Press Enter to generate a random key] > ");
     io::stdout().flush().ok();
 
     let input = read_line();
     if input.trim().is_empty() {
         let key = generate_random_hex(32);
-        println!("Gerado: {key}");
+        println!("Generated: {key}");
         key
     } else {
         input.trim().to_string()
@@ -337,11 +337,11 @@ fn generate_random_hex(num_bytes: usize) -> String {
 
 async fn offer_stake_utxo_picker(client: &CsdRpcClient, collected: &mut Vec<(String, String)>) {
     println!();
-    println!("Buscando UTXOs da wallet do csd pra usar como colateral da stake...");
+    println!("Fetching UTXOs from the csd wallet to use as stake collateral...");
     match client.list_unspent().await {
         Ok(utxos) if !utxos.is_empty() => {
             println!();
-            println!("{:<4} {:<66} {:<5} {:>14} {:>6}  {}", "#", "txid", "vout", "valor (CS)", "conf", "endereço");
+            println!("{:<4} {:<66} {:<5} {:>14} {:>6}  {}", "#", "txid", "vout", "amount (CS)", "conf", "address");
             for (i, u) in utxos.iter().enumerate() {
                 println!(
                     "{:<4} {:<66} {:<5} {:>14.8} {:>6}  {}",
@@ -354,7 +354,7 @@ async fn offer_stake_utxo_picker(client: &CsdRpcClient, collected: &mut Vec<(Str
                 );
             }
             println!();
-            print!("Número da UTXO pra usar como colateral da stake (Enter pra pular): ");
+            print!("UTXO number to use as stake collateral (Enter to skip): ");
             io::stdout().flush().ok();
 
             let choice = read_line();
@@ -363,30 +363,30 @@ async fn offer_stake_utxo_picker(client: &CsdRpcClient, collected: &mut Vec<(Str
                     let picked = &utxos[idx - 1];
                     set_collected(collected, "OPOI_COLLATERAL_TXID", picked.txid.clone());
                     set_collected(collected, "OPOI_COLLATERAL_VOUT", picked.vout.to_string());
-                    println!("Usando {}:{} como colateral da stake.", picked.txid, picked.vout);
+                    println!("Using {}:{} as stake collateral.", picked.txid, picked.vout);
                 }
                 _ => {
                     println!(
-                        "Pulado — sem colateral configurada a stake OPoI não ativa sozinha. Configure OPOI_COLLATERAL_TXID/OPOI_COLLATERAL_VOUT no {ENV_PATH} quando tiver uma UTXO disponível."
+                        "Skipped — without collateral the OPoI stake won't activate on its own. Set OPOI_COLLATERAL_TXID/OPOI_COLLATERAL_VOUT in {ENV_PATH} once you have a UTXO available."
                     );
                 }
             }
         }
         Ok(_) => {
             println!(
-                "Nenhuma UTXO disponível ainda nessa wallet — a stake OPoI não ativa sozinha até essa carteira ter saldo. Configure OPOI_COLLATERAL_TXID/OPOI_COLLATERAL_VOUT no {ENV_PATH} quando tiver."
+                "No UTXOs available yet in this wallet — the OPoI stake won't activate on its own until this wallet has a balance. Set OPOI_COLLATERAL_TXID/OPOI_COLLATERAL_VOUT in {ENV_PATH} once you have one."
             );
         }
         Err(e) => {
-            println!("Não consegui listar UTXOs ({e}) — configure OPOI_COLLATERAL_TXID/OPOI_COLLATERAL_VOUT no {ENV_PATH} manualmente depois.");
+            println!("Couldn't list UTXOs ({e}) — set OPOI_COLLATERAL_TXID/OPOI_COLLATERAL_VOUT in {ENV_PATH} by hand later.");
         }
     }
 }
 
 /// Writes `.env` by copying `.env.example` line by line and substituting
-/// only the `CHAVE=...` lines whose key was collected this run — every
+/// only the `KEY=...` lines whose key was collected this run — every
 /// other line (comments, untouched defaults) survives unchanged. Falls
-/// back to a bare `CHAVE=valor` dump if `.env.example` isn't present.
+/// back to a bare `KEY=value` dump if `.env.example` isn't present.
 fn write_env_file(collected: &[(String, String)]) {
     let contents = match std::fs::read_to_string(ENV_EXAMPLE_PATH) {
         Ok(example) => {
@@ -405,7 +405,7 @@ fn write_env_file(collected: &[(String, String)]) {
     };
 
     if let Err(e) = std::fs::write(ENV_PATH, contents) {
-        println!("Não consegui salvar {ENV_PATH} ({e}) — as variáveis coletadas ficaram só no ambiente deste processo.");
+        println!("Couldn't save {ENV_PATH} ({e}) — the collected variables only exist in this process's environment.");
     }
 }
 
@@ -421,7 +421,7 @@ fn patch_env_file(pairs: &[(String, String)]) {
     let existing = match std::fs::read_to_string(ENV_PATH) {
         Ok(s) => s,
         Err(e) => {
-            println!("Não consegui ler {ENV_PATH} ({e}) — as variáveis coletadas ficaram só no ambiente deste processo.");
+            println!("Couldn't read {ENV_PATH} ({e}) — the collected variables only exist in this process's environment.");
             return;
         }
     };
@@ -449,7 +449,7 @@ fn patch_env_file(pairs: &[(String, String)]) {
     }
 
     match std::fs::write(ENV_PATH, out) {
-        Ok(_) => println!("{ENV_PATH} atualizado."),
-        Err(e) => println!("Não consegui salvar {ENV_PATH} ({e}) — as variáveis coletadas ficaram só no ambiente deste processo."),
+        Ok(_) => println!("{ENV_PATH} updated."),
+        Err(e) => println!("Couldn't save {ENV_PATH} ({e}) — the collected variables only exist in this process's environment."),
     }
 }
