@@ -47,7 +47,7 @@ const REQUIRED_VARS: &[RequiredVar] = &[
     },
     RequiredVar {
         key: "OPOI_ADDRESSES",
-        prompt: "CS address that will hold the OPoI stake (its private key must already be imported into the csd wallet)",
+        prompt: "CS address that will hold the OPoI stake — its private key must already be in the csd wallet this bridge talks to.\n     Don't have one yet? Generate one directly in that wallet: `cs-cli getnewaddress` (freshly generated, key is already there — nothing to import).\n     Reusing an existing address instead? Import its key first: `cs-cli importprivkey \"<privkey>\"`.",
         suggested_default: None,
     },
     RequiredVar {
