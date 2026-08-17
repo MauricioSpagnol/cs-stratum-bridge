@@ -1,6 +1,6 @@
 [package]
 name = "cs-stratum-bridge"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "Bridge/adapter between stratum-based cs-miner clients and the csd daemon — owns the OPoI (AI-inference mining) protocol, relays PoW mining.* traffic through to the upstream pool unchanged"
 
