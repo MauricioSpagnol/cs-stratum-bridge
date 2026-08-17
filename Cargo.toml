@@ -28,6 +28,19 @@ tower-http  = { version = "0.5", features = ["cors", "trace"] }
 # HTTP client (csd JSON-RPC)
 reqwest     = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 
+# Not used directly — forces the `vendored` feature build-wide via Cargo's
+# feature unification. `postgresql_embedded` pulls in `native-tls`/
+# `openssl-sys` transitively (its own HTTP client, to download the Postgres
+# binary on first run) regardless of this crate's own reqwest/sqlx choosing
+# rustls everywhere else, which left the release binary dynamically linked
+# against libssl.so.1.1 — a SONAME that doesn't exist on newer distros
+# (Ubuntu 22.04+ ships OpenSSL 3.x as libssl.so.3), breaking portability the
+# same way an unpinned glibc would (see hive/release.sh in cs-miner for the
+# same class of issue). `vendored` compiles+statically links OpenSSL from
+# source instead, so the resulting binary carries no runtime openssl
+# dependency at all.
+openssl     = { version = "0.10", features = ["vendored"] }
+
 # database
 sqlx        = { version = "0.7", features = ["runtime-tokio-rustls", "postgres", "chrono", "macros", "migrate"] }
 # Embedded Postgres: operators running a bridge/miner shouldn't need to
