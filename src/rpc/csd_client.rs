@@ -246,6 +246,13 @@ impl CsdRpcClient {
     /// payout tick. `AmountFromValue` on the daemon side accepts string
     /// amounts too, so formatting here sidesteps the float round-trip
     /// entirely instead of trying to pick a "safe" rounding of the f64.
+    /// Lists spendable UTXOs in the daemon's own wallet — used by the setup
+    /// wizard (`setup_wizard.rs`) to let the operator pick one as OPoI stake
+    /// collateral instead of having to look up a txid/vout by hand.
+    pub async fn list_unspent(&self) -> Result<Vec<UnspentOutput>, AppError> {
+        self.call("listunspent", serde_json::json!([])).await
+    }
+
     pub async fn send_many(
         &self,
         from_account_or_empty: &str,

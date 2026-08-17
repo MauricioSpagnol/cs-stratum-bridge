@@ -7,6 +7,7 @@ mod opoi;
 mod payout;
 mod proxy;
 mod rpc;
+mod setup_wizard;
 mod stake_pool;
 mod state;
 
@@ -24,6 +25,8 @@ use state::AppState;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    setup_wizard::ensure_configured().await;
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()

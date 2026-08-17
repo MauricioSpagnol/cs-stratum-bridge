@@ -100,3 +100,17 @@ pub struct ShardResultTxRes {
     pub shard_index: u32,
     pub miner_address: String,
 }
+
+/// One element of `listunspent`'s result — used by the setup wizard
+/// (`setup_wizard.rs`) to let the operator pick a UTXO as OPoI stake
+/// collateral. Only the fields the picker needs; `listunspent` returns
+/// several more (scriptPubKey, spendable, solvable, ...) that we ignore.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct UnspentOutput {
+    pub txid: String,
+    pub vout: u32,
+    #[serde(default)]
+    pub address: String,
+    pub amount: f64,
+    pub confirmations: u64,
+}
