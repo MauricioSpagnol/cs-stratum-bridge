@@ -1,4 +1,5 @@
 pub mod handlers;
+pub mod rate_limit;
 
 use axum::routing::{get, post};
 use axum::Router;

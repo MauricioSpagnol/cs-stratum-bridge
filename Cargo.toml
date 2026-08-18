@@ -42,7 +42,7 @@ reqwest     = { version = "0.12", default-features = false, features = ["json", 
 openssl     = { version = "0.10", features = ["vendored"] }
 
 # database
-sqlx        = { version = "0.7", features = ["runtime-tokio-rustls", "postgres", "chrono", "macros", "migrate"] }
+sqlx        = { version = "0.8", features = ["runtime-tokio-rustls", "postgres", "chrono", "macros", "migrate"] }
 # Embedded Postgres: operators running a bridge/miner shouldn't need to
 # install or administer a separate Postgres server themselves — this
 # downloads and manages a real Postgres binary as a private subprocess,

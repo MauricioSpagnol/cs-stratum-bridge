@@ -303,7 +303,17 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
-    let app_state = AppState { db: db_pool.clone(), engine: engine.clone(), shard_engine: shard_engine.clone(), cfg: cfg.clone() };
+    // 30 requests/minute/IP — generous for a legitimate requester app
+    // submitting prompts, tight enough to blunt brute-force/spam against a
+    // publicly-reachable (0.0.0.0-by-default) endpoint.
+    let prompt_rate_limiter = Arc::new(http::rate_limit::RateLimiter::new(30, std::time::Duration::from_secs(60)));
+    let app_state = AppState {
+        db: db_pool.clone(),
+        engine: engine.clone(),
+        shard_engine: shard_engine.clone(),
+        cfg: cfg.clone(),
+        prompt_rate_limiter,
+    };
     let http_router = http::router(app_state);
     let http_addr = cfg.http_listen_addr.clone();
     tokio::spawn(async move {
@@ -315,7 +325,8 @@ async fn main() -> anyhow::Result<()> {
             }
         };
         tracing::info!(addr = %http_addr, "HTTP API listening");
-        if let Err(e) = axum::serve(listener, http_router).await {
+        let service = http_router.into_make_service_with_connect_info::<std::net::SocketAddr>();
+        if let Err(e) = axum::serve(listener, service).await {
             tracing::error!(error = %e, "HTTP server error");
         }
     });

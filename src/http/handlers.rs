@@ -1,4 +1,6 @@
-use axum::extract::{Path, State};
+use std::net::SocketAddr;
+
+use axum::extract::{ConnectInfo, Path, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 use axum::Json;
@@ -31,9 +33,35 @@ struct AcceptedResponse {
     accepted: bool,
 }
 
-pub async fn submit_prompt(State(state): State<AppState>, headers: HeaderMap, Json(body): Json<PromptRequest>) -> impl IntoResponse {
+/// Constant-time byte comparison — `==` on the raw API key would let a
+/// network attacker measure per-byte comparison bailout timing to recover
+/// the key character-by-character. Length is compared normally first (that
+/// alone isn't secret-sensitive); if lengths match, every byte pair is
+/// still visited regardless of where the first mismatch is.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    a.iter().zip(b.iter()).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
+pub async fn submit_prompt(
+    State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Json(body): Json<PromptRequest>,
+) -> impl IntoResponse {
+    // Checked before the API key itself: HTTP_LISTEN_ADDR defaults to
+    // 0.0.0.0 (requester-facing, meant to be reachable from outside this
+    // host), so this endpoint has no other defense against a client
+    // hammering it — including to brute-force the key below.
+    if !state.prompt_rate_limiter.check(peer.ip()) {
+        return (StatusCode::TOO_MANY_REQUESTS, "rate limit exceeded, slow down").into_response();
+    }
+
     let provided = headers.get("x-opoi-api-key").and_then(|v| v.to_str().ok());
-    if provided != Some(state.cfg.opoi_requester_api_key.as_str()) {
+    let authorized = matches!(provided, Some(p) if constant_time_eq(p.as_bytes(), state.cfg.opoi_requester_api_key.as_bytes()));
+    if !authorized {
         return (StatusCode::UNAUTHORIZED, "missing or invalid x-opoi-api-key").into_response();
     }
 

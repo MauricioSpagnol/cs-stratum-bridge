@@ -3,6 +3,7 @@ use std::sync::Arc;
 use sqlx::PgPool;
 
 use crate::config::Config;
+use crate::http::rate_limit::RateLimiter;
 use crate::opoi::{OpoiEngine, ShardEngine};
 
 /// Shared state for the HTTP API. The stratum proxy/engine wiring lives
@@ -13,4 +14,5 @@ pub struct AppState {
     pub engine: Arc<OpoiEngine>,
     pub shard_engine: Arc<ShardEngine>,
     pub cfg: Arc<Config>,
+    pub prompt_rate_limiter: Arc<RateLimiter>,
 }
