@@ -11,6 +11,7 @@ mod setup_wizard;
 mod stake_pool;
 mod state;
 
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -80,10 +81,18 @@ async fn main() -> anyhow::Result<()> {
             // `data_dir` and read its content back on restart instead of
             // trusting a freshly-generated one.
             let password_file = std::path::PathBuf::from(format!("{}.pgpass", cfg.embedded_db_data_dir));
-            let password = if password_file.exists() {
+            // An empty file (e.g. a bind-mount source pre-created with
+            // `touch`) is treated like a missing one — an empty password
+            // is rejected by Postgres ("empty password returned by client").
+            let existing = if password_file.is_file() {
                 std::fs::read_to_string(&password_file)?.trim().to_string()
             } else {
+                String::new()
+            };
+            let password = if existing.is_empty() {
                 uuid::Uuid::new_v4().simple().to_string()
+            } else {
+                existing
             };
             let settings = postgresql_embedded::Settings {
                 data_dir: std::path::PathBuf::from(&cfg.embedded_db_data_dir),
@@ -125,7 +134,7 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!(height, "csd reachable");
 
     let registry = Arc::new(miner_registry::MinerRegistry::new());
-    let engine = Arc::new(OpoiEngine::new(csd.clone(), db_pool.clone(), registry.clone(), stake_pool.clone()));
+    let engine = Arc::new(OpoiEngine::new(csd.clone(), db_pool.clone(), registry.clone(), stake_pool.clone(), cfg.stake_renew_blocks));
 
     // F15-L: only meaningfully active once BOTH a draft model is configured
     // for some target model (DRAFT_MODEL_SOURCES_JSON) AND a draft-capable
@@ -179,11 +188,22 @@ async fn main() -> anyhow::Result<()> {
 
     spawn_interval(cfg.poll_interval_ms, {
         let engine = engine.clone();
+        let consecutive_failures = Arc::new(AtomicU32::new(0));
         move || {
             let engine = engine.clone();
+            let consecutive_failures = consecutive_failures.clone();
             async move {
-                if let Err(e) = engine.poll_and_assign_tick().await {
-                    tracing::warn!(error = %e, "poll_and_assign_tick failed");
+                match engine.poll_and_assign_tick().await {
+                    Err(e) => {
+                        let n = consecutive_failures.fetch_add(1, Ordering::Relaxed) + 1;
+                        tracing::warn!(error = %e, consecutive_failures = n, "poll_and_assign_tick failed");
+                    }
+                    Ok(()) => {
+                        let prev = consecutive_failures.swap(0, Ordering::Relaxed);
+                        if prev > 0 {
+                            tracing::info!(after_failures = prev, "poll_and_assign_tick recovered — csd is reachable again");
+                        }
+                    }
                 }
             }
         }
@@ -191,11 +211,22 @@ async fn main() -> anyhow::Result<()> {
 
     spawn_interval(cfg.poll_interval_ms, {
         let shard_engine = shard_engine.clone();
+        let consecutive_failures = Arc::new(AtomicU32::new(0));
         move || {
             let shard_engine = shard_engine.clone();
+            let consecutive_failures = consecutive_failures.clone();
             async move {
-                if let Err(e) = shard_engine.poll_and_start_tick().await {
-                    tracing::warn!(error = %e, "shard_engine poll_and_start_tick failed");
+                match shard_engine.poll_and_start_tick().await {
+                    Err(e) => {
+                        let n = consecutive_failures.fetch_add(1, Ordering::Relaxed) + 1;
+                        tracing::warn!(error = %e, consecutive_failures = n, "shard_engine poll_and_start_tick failed");
+                    }
+                    Ok(()) => {
+                        let prev = consecutive_failures.swap(0, Ordering::Relaxed);
+                        if prev > 0 {
+                            tracing::info!(after_failures = prev, "shard_engine poll_and_start_tick recovered — csd is reachable again");
+                        }
+                    }
                 }
             }
         }

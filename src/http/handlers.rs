@@ -26,6 +26,22 @@ pub struct PromptRequest {
     /// handed to the engine, so everything downstream (cache, opoi.assign)
     /// only ever deals in the hex form the miner expects.
     pub prompt: String,
+    /// Despacho otimista (opcional): quando presentes, permitem assinalar a
+    /// request ao minerador ANTES de ela confirmar em bloco.
+    ///
+    /// Sem isso o caminho é: submitopoirequest → esperar um bloco → só então
+    /// despachar. Esse bloco é ~55s na testnet e ~2min na mainnet, e é hoje o
+    /// maior componente da latência que o usuário sente — maior que a
+    /// inferência (1,4s) por mais de uma ordem de grandeza.
+    ///
+    /// É seguro porque o pagamento não depende disto: o COMMIT continua
+    /// exigindo a request on-chain, então uma que nunca confirme simplesmente
+    /// não gera commit nem pagamento. O risco é o minerador gastar ~1,4s de
+    /// GPU à toa, e o endpoint já é fechado por x-opoi-api-key.
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub max_tokens: Option<u32>,
 }
 
 #[derive(Debug, Serialize)]
@@ -56,21 +72,24 @@ pub async fn submit_prompt(
     // host), so this endpoint has no other defense against a client
     // hammering it — including to brute-force the key below.
     if !state.prompt_rate_limiter.check(peer.ip()) {
+        tracing::warn!(peer = %peer, request_id = %body.request_id, "[4/5 bridge] POST /cscoin/opoi/prompt rate-limited");
         return (StatusCode::TOO_MANY_REQUESTS, "rate limit exceeded, slow down").into_response();
     }
 
     let provided = headers.get("x-opoi-api-key").and_then(|v| v.to_str().ok());
     let authorized = matches!(provided, Some(p) if constant_time_eq(p.as_bytes(), state.cfg.opoi_requester_api_key.as_bytes()));
     if !authorized {
+        tracing::warn!(peer = %peer, request_id = %body.request_id, key_present = provided.is_some(), "[4/5 bridge] POST /cscoin/opoi/prompt rejected — missing or invalid x-opoi-api-key");
         return (StatusCode::UNAUTHORIZED, "missing or invalid x-opoi-api-key").into_response();
     }
 
+    tracing::info!(peer = %peer, request_id = %body.request_id, "[4/5 bridge] POST /cscoin/opoi/prompt accepted, dispatching to engines");
     let prompt_hex = hex::encode(body.prompt.as_bytes());
     // Fed to both engines: at intake time it isn't known yet whether this
     // request will turn out to be shard-routed (ShardEngine) or whole-model
     // (OpoiEngine) — that's only decided once getmodelmanifest resolves.
     state.shard_engine.receive_prompt(&body.request_id, prompt_hex.clone());
-    match state.engine.receive_prompt(&body.request_id, prompt_hex).await {
+    match state.engine.receive_prompt(&body.request_id, prompt_hex, body.model.clone(), body.max_tokens).await {
         Ok(true) => (StatusCode::OK, Json(AcceptedResponse { accepted: true })).into_response(),
         Ok(false) => (StatusCode::NOT_FOUND, "request_id not found on-chain").into_response(),
         Err(e) => {

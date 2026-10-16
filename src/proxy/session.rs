@@ -363,11 +363,21 @@ async fn down_reader_loop(
                     if let Some(addr_raw) = v.get("params").and_then(|p| p.get(0)).and_then(Value::as_str) {
                         let stripped = addr_raw.strip_prefix("SOLO:").unwrap_or(addr_raw);
                         let wallet_only = stripped.split('.').next().unwrap_or(stripped).to_string();
+                        tracing::info!(wallet = %wallet_only, "mining.authorize from miner, forwarding upstream");
                         *auth.pending.lock() = Some(wallet_only);
                     }
                 }
                 // Forward unchanged — the real pool still needs to see (and
                 // authorize) this itself.
+                let _ = up_tx.send(line);
+            }
+            Some("mining.submit") => {
+                // No instrumentation existed here before — added specifically
+                // to make "did the share even leave the bridge?" answerable
+                // from the bridge's own log, instead of only being inferable
+                // (or not) from the upstream pool's log.
+                let wallet = auth.confirmed.lock().clone();
+                tracing::info!(wallet = ?wallet, line = %line, "mining.submit from miner, forwarding upstream");
                 let _ = up_tx.send(line);
             }
             _ => {
@@ -425,6 +435,15 @@ async fn up_reader_loop(
                     registry.register(wallet.clone(), down_tx.clone());
                     tracing::info!(wallet = %wallet, "miner authorized upstream; registered");
                 }
+            } else if v.get("id").is_some() {
+                // Any other id'd response from upstream — in practice this is
+                // almost always the mining.submit ack/reject. No prior
+                // instrumentation existed for this, so "did the pool
+                // accept/reject the share" was previously invisible from the
+                // bridge's own log (only from the upstream pool's log, if
+                // that log had anything either).
+                let wallet = auth.confirmed.lock().clone();
+                tracing::info!(wallet = ?wallet, line = %line, "response from upstream pool, forwarding to miner");
             }
         }
 

@@ -91,14 +91,49 @@ pub struct Config {
     #[arg(long, env = "OPOI_REQUESTER_API_KEY")]
     pub opoi_requester_api_key: String,
 
-    #[arg(long, env = "POLL_INTERVAL_MS", default_value_t = 15_000)]
+    /// Com que frequência procurar requests PENDING prontas para despachar.
+    ///
+    /// Era 15s, e isso ia direto para a latência que o usuário sente: uma
+    /// request confirmada logo após um tick espera o tick inteiro antes de
+    /// chegar ao minerador. Medido em 2026-08-28: 14s entre a confirmação em
+    /// bloco e a resposta, dos quais ~12s eram só esperar este temporizador —
+    /// a inferência em si levou 1,4s. É uma leitura barata (listopoirequests),
+    /// então rodar de 2 em 2 segundos custa pouco e devolve quase todo esse
+    /// tempo.
+    #[arg(long, env = "POLL_INTERVAL_MS", default_value_t = 2_000)]
     pub poll_interval_ms: u64,
 
     #[arg(long, env = "REVEAL_POLL_INTERVAL_MS", default_value_t = 15_000)]
     pub reveal_poll_interval_ms: u64,
 
-    #[arg(long, env = "RENEW_INTERVAL_MS", default_value_t = 21_600_000)]
+    /// How often to CHECK whether any pool stake needs renewing. This is a
+    /// cheap read (getblockcount + getopoistake); a RENEW tx is only sent when
+    /// `stake_renew_blocks` has actually elapsed or the stake is SUSPENDED, so
+    /// checking often costs nothing. It used to be the renewal period itself,
+    /// defaulting to 6 hours — see `stake_renew_blocks` for why that was wrong.
+    #[arg(long, env = "RENEW_INTERVAL_MS", default_value_t = 60_000)]
     pub renew_interval_ms: u64,
+
+    /// Renew a stake once this many BLOCKS have passed since its last renewal.
+    ///
+    /// The consensus deadline is counted in blocks (`nOPoIStakeRenewalBlocks`:
+    /// 200 on testnet, 20160 on mainnet), but this process only has a clock —
+    /// and the two only agree while blocks arrive at the rate someone assumed.
+    /// They stopped agreeing on 2026-08-28: testnet went from ~1 block/2h to
+    /// ~1 block/10s, which turned a 200-block deadline into ~33 minutes while
+    /// the old 6-hour timer kept sleeping. The stake suspended roughly eleven
+    /// times over before a renewal was even attempted, every OPoI response
+    /// failed to commit, and it took a hand-run `renewopoistake` to recover —
+    /// which is exactly the thing an operator cannot be expected to know.
+    ///
+    /// Counting in blocks removes the assumption entirely: renewal now tracks
+    /// the same unit the deadline is written in, at any block rate, on any
+    /// network. The default is half of testnet's window — safe everywhere,
+    /// merely more frequent than strictly needed on mainnet (one cheap tx per
+    /// 100 blocks). Raise it toward `nOPoIStakeRenewalBlocks / 2` for the
+    /// network in use to trade margin for fees.
+    #[arg(long, env = "STAKE_RENEW_BLOCKS", default_value_t = 100)]
+    pub stake_renew_blocks: u64,
 
     #[arg(long, env = "PAYOUT_INTERVAL_MS", default_value_t = 3_600_000)]
     pub payout_interval_ms: u64,

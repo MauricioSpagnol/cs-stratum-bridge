@@ -58,10 +58,18 @@ pub struct OpoiEngine {
     pending: DashMap<String, PendingRequest>,
     last_assigned: Mutex<Option<String>>,
     stake_pool: Arc<StakePool>,
+    /// Block age at which a stake is renewed — see `Config::stake_renew_blocks`.
+    stake_renew_blocks: u64,
 }
 
 impl OpoiEngine {
-    pub fn new(csd: Arc<CsdRpcClient>, db: PgPool, registry: Arc<MinerRegistry>, stake_pool: Arc<StakePool>) -> Self {
+    pub fn new(
+        csd: Arc<CsdRpcClient>,
+        db: PgPool,
+        registry: Arc<MinerRegistry>,
+        stake_pool: Arc<StakePool>,
+        stake_renew_blocks: u64,
+    ) -> Self {
         Self {
             csd,
             db,
@@ -70,6 +78,7 @@ impl OpoiEngine {
             pending: DashMap::new(),
             last_assigned: Mutex::new(None),
             stake_pool,
+            stake_renew_blocks,
         }
     }
 
@@ -160,8 +169,50 @@ impl OpoiEngine {
     /// an interval by main.rs, and once at startup by `ensure_stake` for any
     /// address found SUSPENDED.
     pub async fn renew_tick(&self) {
+        // Ask the chain how old each stake is rather than assuming the wall
+        // clock tracks it. `nOPoIStakeRenewalBlocks` is counted in blocks, so
+        // a stake ages at the block rate, not at the rate this timer fires —
+        // see `Config::stake_renew_blocks` for the outage that taught us.
+        let height = match self.csd.get_chain_height().await {
+            Ok(h) => h,
+            Err(e) => {
+                // Without a height there is no way to tell which stakes are
+                // due. Skip this tick rather than renewing every address
+                // blindly; the next tick is seconds away.
+                tracing::warn!(error = %e, "stake renewal: cannot read chain height; skipping this tick");
+                return;
+            }
+        };
+
         for addr in self.stake_pool.addresses() {
-            self.renew_one(addr).await;
+            match self.csd.get_opoi_stake(addr).await {
+                Ok(Some(stake)) => {
+                    // A stake with no renewal on record has only ever been
+                    // aged from the height it was staked at, which this type
+                    // does not carry — treat it as due and let the renewal
+                    // establish the baseline. Costs one tx, once.
+                    let last = stake.last_renewal_height.unwrap_or(0);
+                    let age = height.saturating_sub(last);
+
+                    if stake.status == "SUSPENDED" {
+                        // Already past the deadline: every response this
+                        // address commits is rejected until it is ACTIVE
+                        // again, so do not wait for the age threshold.
+                        tracing::warn!(address = %addr, age_blocks = age, "stake is SUSPENDED; renewing now");
+                        self.renew_one(addr).await;
+                    } else if age >= self.stake_renew_blocks {
+                        tracing::info!(address = %addr, age_blocks = age, "stake due for renewal");
+                        self.renew_one(addr).await;
+                    }
+                    // Otherwise: nothing to do, and no transaction sent.
+                }
+                Ok(None) => {
+                    tracing::warn!(address = %addr, "stake renewal: no stake found for pool address");
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, address = %addr, "stake renewal: could not read stake");
+                }
+            }
         }
     }
 
@@ -208,17 +259,65 @@ impl OpoiEngine {
     /// prompt against a cached (or freshly-fetched) on-chain request so it
     /// becomes eligible for assignment. Returns false if the request_id is
     /// unknown even to the daemon.
-    pub async fn receive_prompt(&self, request_id: &str, prompt_hex: String) -> anyhow::Result<bool> {
+    pub async fn receive_prompt(
+        &self,
+        request_id: &str,
+        prompt_hex: String,
+        model: Option<String>,
+        max_tokens: Option<u32>,
+    ) -> anyhow::Result<bool> {
         if let Some(mut entry) = self.pending.get_mut(request_id) {
             entry.prompt_hex = Some(prompt_hex);
+            tracing::info!(request_id = %request_id, "[4/5 bridge] prompt received — matched already-cached PENDING request");
             return Ok(true);
         }
         match self.csd.get_request(request_id).await {
             Ok(request) => {
                 self.pending.insert(request_id.to_string(), PendingRequest { request, prompt_hex: Some(prompt_hex) });
+                tracing::info!(request_id = %request_id, "[4/5 bridge] prompt received — request not yet in cache, fetched from csd and cached");
                 Ok(true)
             }
-            Err(_) => Ok(false),
+            Err(e) => {
+                // Não confirmada ainda. Se o chamador disse qual modelo e
+                // quantos tokens, dá para começar a inferência agora em vez de
+                // esperar o bloco — ver PromptRequest::model para por que isso
+                // é seguro (o COMMIT ainda exige a request on-chain, então uma
+                // que nunca confirme não gera pagamento).
+                //
+                // A entrada provisória é substituída pela real assim que
+                // poll_and_assign_tick a encontrar on-chain: o `insert` daquele
+                // caminho sobrescreve esta, e o prompt já cacheado sobrevive.
+                if let (Some(model), Some(max_tokens)) = (model, max_tokens) {
+                    tracing::info!(
+                        request_id = %request_id, model = %model,
+                        "[4/5 bridge] prompt received before on-chain confirmation — despachando otimista"
+                    );
+                    self.pending.insert(
+                        request_id.to_string(),
+                        PendingRequest {
+                            request: OpoiRequest {
+                                request_id: request_id.to_string(),
+                                model,
+                                // Só o daemon conhece o hash real; este campo é
+                                // informativo aqui (usado como metadado do
+                                // submission) e é corrigido quando a request
+                                // confirma. Vazio em vez de um valor inventado,
+                                // para não parecer um hash de verdade.
+                                prompt_hash: String::new(),
+                                max_tokens,
+                                payment: 0.0,
+                                fee_per_token: 0.0,
+                                task_type: None,
+                                task_class: None,
+                            },
+                            prompt_hex: Some(prompt_hex),
+                        },
+                    );
+                    return Ok(true);
+                }
+                tracing::warn!(request_id = %request_id, error = %e, "[4/5 bridge] prompt received but get_request lookup failed — request not confirmed on-chain yet, or csd unreachable; returning 404 to caller");
+                Ok(false)
+            }
         }
     }
 
@@ -266,6 +365,17 @@ impl OpoiEngine {
             .filter(|e| e.prompt_hex.is_some() && self.assignments.assignee(e.key()).is_none())
             .map(|e| e.key().clone())
             .collect();
+
+        if !self.pending.is_empty() || !candidates.is_empty() {
+            let awaiting_prompt = self.pending.iter().filter(|e| e.prompt_hex.is_none()).count();
+            tracing::debug!(
+                pending_total = self.pending.len(),
+                awaiting_prompt,
+                candidates = candidates.len(),
+                connected_miners = self.registry.snapshot_all().len(),
+                "[poll_and_assign_tick] summary"
+            );
+        }
 
         for request_id in candidates {
             let Some((prompt_hex, model, max_tokens, task_type, task_class)) = self.pending.get(&request_id).map(|e| {
@@ -329,6 +439,7 @@ impl OpoiEngine {
             let wallet = {
                 let mut last = self.last_assigned.lock();
                 let Some(wallet) = self.registry.pick_next(&last) else {
+                    tracing::warn!(request_id = %request_id, "[5/5 bridge->miner] no miner connected to pick_next — request has a prompt ready but nothing to assign it to this tick");
                     break; // no miners connected right now, nothing more to do this tick
                 };
                 *last = Some(wallet.clone());
@@ -338,12 +449,26 @@ impl OpoiEngine {
             if self.assignments.try_assign(&request_id, &wallet) {
                 if let Some(tx) = self.registry.get(&wallet) {
                     let assign = OpoiAssign { request_id: request_id.clone(), model, prompt_hex, max_tokens, task_type, task_class };
-                    let _ = tx.send(build_assign_line(&assign));
-                    tracing::info!(request_id = %request_id, wallet = %wallet, "assigned OPoI request");
+                    match tx.send(build_assign_line(&assign)) {
+                        Ok(()) => {
+                            tracing::info!(request_id = %request_id, wallet = %wallet, "[5/5 bridge->miner] assigned OPoI request — opoi.assign sent over stratum");
+                        }
+                        Err(e) => {
+                            // Receiver dropped — the session's write task already
+                            // exited (miner disconnected) but the registry entry
+                            // hadn't been cleaned up yet by that instant. Without
+                            // this, try_assign above already marked the request
+                            // assigned and it would silently stall forever: no
+                            // error anywhere, message never actually sent.
+                            tracing::error!(request_id = %request_id, wallet = %wallet, error = %e, "[5/5 bridge->miner] opoi.assign send FAILED — miner channel closed, releasing assignment for retry");
+                            self.assignments.remove(&request_id);
+                        }
+                    }
                 } else {
                     // Registry entry vanished between pick_next and get (miner
                     // disconnected in that instant) — release immediately so
                     // the next tick can hand it to someone else.
+                    tracing::warn!(request_id = %request_id, wallet = %wallet, "[5/5 bridge->miner] registry entry vanished before send — releasing assignment for retry");
                     self.assignments.remove(&request_id);
                 }
             }
@@ -556,54 +681,97 @@ pub(crate) async fn do_commit(
     response_hash: String,
     token_count: u32,
 ) {
-    let results: Vec<(String, Result<crate::rpc::types::CommitResult, AppError>)> = stream::iter(stake_pool.addresses().to_vec())
-        .map(|addr| {
-            let csd = csd.clone();
-            let request_id = request_id.clone();
-            let response_hash = response_hash.clone();
-            async move {
-                let res = csd.submit_response_commit(&request_id, &response_hash, &addr, token_count).await;
-                (addr, res)
-            }
-        })
-        .buffer_unordered(4)
-        .collect()
-        .await;
+    // Retry, because a failed commit here is not cheap: the miner has already
+    // paused PoW, run the model and handed back a result, and the requester has
+    // already paid. Giving up on the first error throws all of that away and
+    // the request is never reassigned (see `on_result` — it is "spoken for"
+    // the moment the result arrives).
+    //
+    // The failure this exists for is transient by nature: on 2026-08-28 every
+    // address failed because the pool's stake had drifted into SUSPENDED, a
+    // state a single RENEW tx clears in one block. One round of retries would
+    // have recovered silently; instead the response was lost and the operator
+    // was left with "marking FAILED" and no reason attached. So each round now
+    // reactivates whatever it can before trying again, and the per-address
+    // error is logged at WARN rather than buried at DEBUG.
+    //
+    // Bounded on purpose: the consensus commit window is finite
+    // (`nOPoIResponseCommitWindowBlocks`), so retrying past it only burns RPC.
+    // Five rounds spaced 15s covers ~1 minute, comfortably inside a 20-block
+    // window at any sane block rate, and stops well short of it.
+    const MAX_ROUNDS: u32 = 5;
+    const RETRY_DELAY_SECS: u64 = 15;
 
-    let mut first_success: Option<(String, crate::rpc::types::CommitResult)> = None;
+    for round in 1..=MAX_ROUNDS {
+        let results: Vec<(String, Result<crate::rpc::types::CommitResult, AppError>)> = stream::iter(stake_pool.addresses().to_vec())
+            .map(|addr| {
+                let csd = csd.clone();
+                let request_id = request_id.clone();
+                let response_hash = response_hash.clone();
+                async move {
+                    let res = csd.submit_response_commit(&request_id, &response_hash, &addr, token_count).await;
+                    (addr, res)
+                }
+            })
+            .buffer_unordered(4)
+            .collect()
+            .await;
 
-    for (addr, res) in results {
-        match res {
-            Ok(r) => {
-                if let Err(e) =
-                    db::repo::upsert_commit_attempt_success(&pool, submission_id, &addr, &r.txid, &r.nonce_hex, r.commit_window_closes_at_height as i32).await
-                {
-                    tracing::error!(error = %e, submission_id, address = %addr, "failed to persist COMMITTED attempt");
-                } else {
-                    tracing::info!(submission_id, request_id = %request_id, address = %addr, txid = %r.txid, "OPoI response committed on-chain (one pool address)");
+        let mut first_success: Option<(String, crate::rpc::types::CommitResult)> = None;
+
+        for (addr, res) in results {
+            match res {
+                Ok(r) => {
+                    if let Err(e) =
+                        db::repo::upsert_commit_attempt_success(&pool, submission_id, &addr, &r.txid, &r.nonce_hex, r.commit_window_closes_at_height as i32).await
+                    {
+                        tracing::error!(error = %e, submission_id, address = %addr, "failed to persist COMMITTED attempt");
+                    } else {
+                        tracing::info!(submission_id, request_id = %request_id, address = %addr, txid = %r.txid, "OPoI response committed on-chain (one pool address)");
+                    }
+                    if first_success.is_none() {
+                        first_success = Some((addr, r));
+                    }
                 }
-                if first_success.is_none() {
-                    first_success = Some((addr, r));
+                Err(e) => {
+                    let _ = db::repo::upsert_commit_attempt_failure(&pool, submission_id, &addr, &e.to_string()).await;
+                    // WARN, not DEBUG: this string is the only place the real
+                    // reason ever appears, and an operator chasing a stuck
+                    // response needs it without turning on debug logging.
+                    tracing::warn!(error = %e, submission_id, address = %addr, round, "commit attempt failed for this pool address");
                 }
-            }
-            Err(e) => {
-                let _ = db::repo::upsert_commit_attempt_failure(&pool, submission_id, &addr, &e.to_string()).await;
-                tracing::debug!(error = %e, submission_id, address = %addr, "commit attempt failed for this pool address");
             }
         }
-    }
 
-    match first_success {
-        Some((_addr, r)) => {
+        if let Some((_addr, r)) = first_success {
             if let Err(e) = db::repo::mark_committed(&pool, submission_id, &r.txid, &r.nonce_hex, r.commit_window_closes_at_height as i32).await {
                 tracing::error!(error = %e, submission_id, "failed to persist overall COMMITTED state");
             }
+            return;
         }
-        None => {
-            tracing::warn!(submission_id, request_id = %request_id, "every pool address failed to commit; marking FAILED");
-            if let Err(e2) = db::repo::mark_failed(&pool, submission_id, "all stake-pool addresses failed to commit").await {
-                tracing::error!(error = %e2, submission_id, "failed to persist FAILED state");
+
+        if round < MAX_ROUNDS {
+            // Clear the one cause we can actually fix from here. A renewal
+            // needs a block to take effect, which the delay below covers.
+            for addr in stake_pool.addresses() {
+                if let Ok(Some(stake)) = csd.get_opoi_stake(addr).await {
+                    if stake.status == "SUSPENDED" {
+                        tracing::warn!(submission_id, address = %addr, "stake SUSPENDED during commit; renewing before retry");
+                        match csd.renew_opoi_stake(addr).await {
+                            Ok(txid) => {
+                                let _ = db::repo::log_stake_event(&pool, "RENEW", Some(&txid), &format!("commit retry for {addr}")).await;
+                            }
+                            Err(e) => tracing::warn!(error = %e, address = %addr, "renewal during commit retry failed"),
+                        }
+                    }
+                }
             }
+            tokio::time::sleep(std::time::Duration::from_secs(RETRY_DELAY_SECS)).await;
         }
+    }
+
+    tracing::warn!(submission_id, request_id = %request_id, rounds = MAX_ROUNDS, "every pool address failed to commit; marking FAILED");
+    if let Err(e2) = db::repo::mark_failed(&pool, submission_id, "all stake-pool addresses failed to commit").await {
+        tracing::error!(error = %e2, submission_id, "failed to persist FAILED state");
     }
 }
