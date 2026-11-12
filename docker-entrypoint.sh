@@ -20,4 +20,14 @@ chown -R bridge:bridge "${EMBEDDED_DB_DATA_DIR:-/app/bridge_pgdata}" "${AUDITOR_
 # stale at this point; remove it.
 rm -f "${EMBEDDED_DB_DATA_DIR:-/app/bridge_pgdata}/postmaster.pid"
 
+# The embedded-Postgres release currently downloaded (18.6.1) ships an
+# incomplete share/timezone: UTC, GMT and Etc/UTC are missing (links dropped
+# on extraction), but initdb wrote "Etc/UTC" into postgresql.conf, so
+# Postgres FATALs ("invalid value for parameter TimeZone") and never starts.
+# GMT+0 is present in that tree and is equivalent (UTC offset 0).
+PGCONF="${EMBEDDED_DB_DATA_DIR:-/app/bridge_pgdata}/postgresql.conf"
+if [ -f "$PGCONF" ]; then
+  sed -i -E "s#^([[:space:]]*(log_)?timezone[[:space:]]*=[[:space:]]*)'?Etc/UTC'?#\\1'GMT+0'#" "$PGCONF"
+fi
+
 exec setpriv --reuid bridge --regid bridge --clear-groups /usr/local/bin/cs-stratum-bridge "$@"
