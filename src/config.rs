@@ -46,6 +46,13 @@ pub struct Config {
     #[arg(long, env = "EMBEDDED_DB_PORT", default_value_t = 5488)]
     pub embedded_db_port: u16,
 
+    /// Exact embedded Postgres release to download/run (semver requirement,
+    /// e.g. `=18.6.1`). Pinned so a new upstream release can't silently
+    /// change what runs against an existing data dir. Must keep the same
+    /// major version as the data dir. Ignored if DATABASE_URL is set.
+    #[arg(long, env = "EMBEDDED_DB_VERSION", default_value = "=18.6.1")]
+    pub embedded_db_version: String,
+
     /// Comma-separated list of the bridge's OPoI stake identities. Each
     /// address's private key must already be imported in csd's own wallet
     /// (this service never holds key material) and, beyond the first/

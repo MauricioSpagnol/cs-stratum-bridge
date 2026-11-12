@@ -99,6 +99,7 @@ async fn main() -> anyhow::Result<()> {
                 port: cfg.embedded_db_port,
                 password_file,
                 password,
+                version: postgresql_embedded::VersionReq::parse(&cfg.embedded_db_version)?,
                 // NOT a scratch/test instance — this is the bridge's real,
                 // persistent database. `temporary: true` (this crate's
                 // usual default, meant for ephemeral test fixtures) would
