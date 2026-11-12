@@ -9,7 +9,7 @@ set -e
 # fresh `docker compose up` on the host, so fix ownership here (as root,
 # before dropping privileges) instead of requiring an operator to `chown`
 # the host paths by hand before every deploy.
-chown -R bridge:bridge "${EMBEDDED_DB_DATA_DIR:-/app/bridge_pgdata}" "${AUDITOR_CACHE_DIR:-/app/auditor_cache}" 2>/dev/null || true
+chown -R bridge:bridge "${EMBEDDED_DB_DATA_DIR:-/app/bridge_pgdata}" "${AUDITOR_CACHE_DIR:-/app/auditor_cache}" /app/.theseus 2>/dev/null || true
 
 # A container killed/restarted without a clean shutdown leaves a stale
 # postmaster.pid in the persisted data dir. In a fresh container PID
