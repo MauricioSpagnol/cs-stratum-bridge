@@ -112,7 +112,16 @@ async fn main() -> anyhow::Result<()> {
             // release over HTTPS (cached afterward) — needs outbound
             // internet access once; every subsequent start reuses the
             // cached binary and this host's persisted data_dir.
-            pg.setup().await?;
+            if let Err(e) = pg.setup().await {
+                // api.github.com rate-limits per IP (403) — common behind
+                // NAT or after crash loops. Fetch the release asset directly
+                // (not rate-limited) and retry; the crate then finds it
+                // installed and skips its API lookup.
+                tracing::warn!(error = %e, "embedded Postgres setup failed; trying direct download fallback");
+                download_postgres_direct(&cfg.embedded_db_version, &pg.settings().installation_dir).await
+                    .map_err(|e2| anyhow::anyhow!("setup failed ({e}); direct download fallback failed too: {e2}"))?;
+                pg.setup().await?;
+            }
             // The downloaded release can ship share/timezone without
             // UTC/GMT/Etc/UTC (observed with 18.6.1), which makes Postgres
             // reject both postgresql.conf ("Etc/UTC") and sqlx's startup
@@ -491,5 +500,76 @@ mod tz_tests {
         let c = std::fs::read_to_string(root.join("data/postgresql.conf")).unwrap();
         assert!(c.contains("timezone = 'UTC'") && c.contains("port = 1") && !c.contains("Nowhere"), "{c}");
         std::fs::remove_dir_all(root).ok();
+    }
+}
+
+/// Download `postgresql-<ver>-<triple>.tar.gz` from the theseus-rs GitHub
+/// release assets and extract it (minus the top-level dir) into `dest`.
+/// Only used as a fallback when the crate's own API-based download fails.
+async fn download_postgres_direct(version_req: &str, dest: &std::path::Path) -> anyhow::Result<()> {
+    let version = version_req.trim().trim_start_matches('=').trim();
+    anyhow::ensure!(
+        version.split('.').count() == 3 && version.split('.').all(|p| p.parse::<u32>().is_ok()),
+        "EMBEDDED_DB_VERSION must be an exact x.y.z version for the direct-download fallback (got {version_req})"
+    );
+    let triple = match std::env::consts::ARCH {
+        "x86_64" => "x86_64-unknown-linux-gnu",
+        "aarch64" => "aarch64-unknown-linux-gnu",
+        other => anyhow::bail!("no direct-download fallback for architecture {other}"),
+    };
+    let url = format!("https://github.com/theseus-rs/postgresql-binaries/releases/download/{version}/postgresql-{version}-{triple}.tar.gz");
+    tracing::info!(%url, "downloading embedded Postgres directly");
+    let bytes = reqwest::Client::new().get(&url).send().await?.error_for_status()?.bytes().await?;
+    let dest = dest.to_path_buf();
+    tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+        // Extract into a sibling temp dir, then rename: a half-extracted
+        // install dir would be mistaken for a valid one next start.
+        let tmp = dest.with_extension("partial");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp)?;
+        let mut ar = tar::Archive::new(flate2::read::GzDecoder::new(&bytes[..]));
+        for entry in ar.entries()? {
+            let mut entry = entry?;
+            let path = entry.path()?.into_owned();
+            let rel: std::path::PathBuf = path.components().skip(1).collect();
+            if rel.as_os_str().is_empty() || rel.components().any(|c| matches!(c, std::path::Component::ParentDir)) {
+                continue;
+            }
+            let out = tmp.join(&rel);
+            if let Some(parent) = out.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            if entry.header().entry_type().is_hard_link() {
+                // Hard-link targets are archive paths incl. the top-level
+                // dir; re-root them. (Tar extraction order guarantees the
+                // target already exists.) Copy instead of link: harmless and
+                // robust across filesystems.
+                if let Some(target) = entry.link_name()? {
+                    let target: std::path::PathBuf = target.components().skip(1).collect();
+                    let _ = std::fs::remove_file(&out);
+                    std::fs::copy(tmp.join(target), &out)?;
+                }
+                continue;
+            }
+            entry.unpack(&out)?;
+        }
+        anyhow::ensure!(tmp.join("bin").join("postgres").is_file(), "downloaded archive has no bin/postgres");
+        let _ = std::fs::remove_dir_all(&dest);
+        std::fs::rename(&tmp, &dest)?;
+        Ok(())
+    }).await??;
+    Ok(())
+}
+
+#[cfg(test)]
+mod dl_tests {
+    #[tokio::test]
+    #[ignore = "network: downloads ~25MB from GitHub"]
+    async fn direct_download_extracts_postgres() {
+        let d = std::env::temp_dir().join(format!("pgdl-{}/18.6.1", std::process::id()));
+        std::fs::create_dir_all(d.parent().unwrap()).unwrap();
+        super::download_postgres_direct("=18.6.1", &d).await.unwrap();
+        assert!(d.join("bin/postgres").is_file() && d.join("share/timezone").is_dir());
+        std::fs::remove_dir_all(d.parent().unwrap()).ok();
     }
 }

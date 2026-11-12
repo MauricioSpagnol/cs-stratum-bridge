@@ -51,6 +51,10 @@ sqlx        = { version = "0.8", features = ["runtime-tokio-rustls", "postgres",
 # (see config.rs/main.rs); an operator who already runs their own Postgres
 # can still point at it directly.
 postgresql_embedded = "0.21"
+# Fallback download of the embedded Postgres tarball straight from the GitHub
+# release asset URL (no API call) when api.github.com rate-limits us (403).
+tar         = "0.4"
+flate2      = "1"
 
 # crypto / encoding
 sha2        = "0.10"
