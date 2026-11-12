@@ -112,6 +112,11 @@ async fn main() -> anyhow::Result<()> {
             // internet access once; every subsequent start reuses the
             // cached binary and this host's persisted data_dir.
             pg.setup().await?;
+            // The downloaded release can ship share/timezone without
+            // UTC/GMT/Etc/UTC (observed with 18.6.1), which makes Postgres
+            // reject both postgresql.conf ("Etc/UTC") and sqlx's startup
+            // parameter TimeZone=UTC. Self-heal before start, on any host.
+            ensure_utc_timezones(&pg.settings().installation_dir, std::path::Path::new(&cfg.embedded_db_data_dir));
             pg.start().await?;
             const DB_NAME: &str = "cs_stratum_bridge";
             if !pg.database_exists(DB_NAME).await? {
@@ -415,4 +420,75 @@ where
             make_fut().await;
         }
     });
+}
+
+/// Canonical 114-byte TZif2 "UTC" zone file (identical to tzdata's Etc/UTC).
+const UTC_TZIF: [u8; 114] = [0x54, 0x5a, 0x69, 0x66, 0x32, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x55, 0x54, 0x43, 0x00, 0x54, 0x5a, 0x69, 0x66, 0x32, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x55, 0x54, 0x43, 0x00, 0x0a, 0x55, 0x54, 0x43, 0x30, 0x0a];
+
+/// Make sure the embedded Postgres' own `share/timezone` can resolve the UTC
+/// aliases, and that `postgresql.conf` doesn't name a zone it lacks. Never
+/// overwrites an existing zone file; failures are logged, not fatal.
+fn ensure_utc_timezones(install_dir: &std::path::Path, data_dir: &std::path::Path) {
+    let tz_dir = install_dir.join("share").join("timezone");
+    if tz_dir.is_dir() {
+        for name in ["UTC", "UCT", "Zulu", "Universal", "GMT", "Greenwich", "GMT0", "GMT+0", "GMT-0",
+                     "Etc/UTC", "Etc/UCT", "Etc/Zulu", "Etc/Universal", "Etc/GMT", "Etc/Greenwich",
+                     "Etc/GMT0", "Etc/GMT+0", "Etc/GMT-0"] {
+            let path = tz_dir.join(name);
+            if path.exists() {
+                continue;
+            }
+            if let Some(parent) = path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            if let Err(e) = std::fs::write(&path, UTC_TZIF) {
+                tracing::warn!(error = %e, zone = name, "could not create missing timezone file");
+            }
+        }
+    } else {
+        tracing::warn!(dir = %tz_dir.display(), "embedded Postgres share/timezone not found");
+    }
+    // Existing data dirs created by initdb may name a zone that's still
+    // missing in some other install; fall back to UTC-equivalent GMT+0
+    // only if the named zone file isn't there.
+    let conf = data_dir.join("postgresql.conf");
+    if let Ok(text) = std::fs::read_to_string(&conf) {
+        let mut changed = false;
+        let out: Vec<String> = text.lines().map(|l| {
+            let t = l.trim_start();
+            for key in ["timezone", "log_timezone"] {
+                if let Some(rest) = t.strip_prefix(key) {
+                    if let Some(v) = rest.trim_start().strip_prefix('=') {
+                        let zone = v.split('#').next().unwrap_or("").trim().trim_matches('\'');
+                        if !zone.is_empty() && !tz_dir.join(zone).exists() {
+                            changed = true;
+                            return format!("{key} = 'UTC'");
+                        }
+                    }
+                }
+            }
+            l.to_string()
+        }).collect();
+        if changed {
+            let _ = std::fs::write(&conf, out.join("\n") + "\n");
+        }
+    }
+}
+
+#[cfg(test)]
+mod tz_tests {
+    #[test]
+    fn creates_missing_utc_and_fixes_conf() {
+        let root = std::env::temp_dir().join(format!("tzt-{}", std::process::id()));
+        let tz = root.join("inst/share/timezone/Etc");
+        std::fs::create_dir_all(&tz).unwrap();
+        std::fs::create_dir_all(root.join("data")).unwrap();
+        std::fs::write(root.join("data/postgresql.conf"), "timezone = 'Nowhere/X'\nlog_timezone = 'Etc/UTC'  # c\nport = 1\n").unwrap();
+        super::ensure_utc_timezones(&root.join("inst"), &root.join("data"));
+        assert!(root.join("inst/share/timezone/UTC").is_file());
+        assert!(root.join("inst/share/timezone/Etc/UTC").is_file());
+        let c = std::fs::read_to_string(root.join("data/postgresql.conf")).unwrap();
+        assert!(c.contains("timezone = 'UTC'") && c.contains("port = 1") && !c.contains("Nowhere"), "{c}");
+        std::fs::remove_dir_all(root).ok();
+    }
 }
