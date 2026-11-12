@@ -28,11 +28,15 @@ FROM debian:bookworm-slim
 ## link libgssapi_krb5.so.2; postgres also links libxml2.so.2). Found via
 ## `ldd` against the actual downloaded binaries after a plain libssl3 image
 ## failed with "libgssapi_krb5.so.2: cannot open shared object file".
+## tzdata: the postgres binary resolves timezones from the system zoneinfo;
+## without it postgresql.conf (TimeZone/log_timezone = Etc/UTC) is rejected
+## ("invalid value for parameter TimeZone") and Postgres FATALs on start.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates \
         libssl3 \
         libgssapi-krb5-2 \
         libxml2 \
+        tzdata \
     && rm -rf /var/lib/apt/lists/*
 
 ## The embedded-Postgres binaries this crate manages (initdb/postgres) hard-
